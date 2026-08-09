@@ -355,6 +355,47 @@ func TestRunClassifiesDumpAndStagingBoundaryFailures(t *testing.T) {
 	}
 }
 
+func TestRunClassifiesCallbackAsPrimaryAndPreservesSecondaryCompressionFailure(t *testing.T) {
+	callbackCause := errors.New("dump callback failed")
+	closeCause := errors.New("gzip close failed")
+	callbackErr := &dump.RunError{Kind: dump.FailureExecution, Err: callbackCause}
+	closeErr := &stage.Error{Kind: stage.FailureCompression, Err: closeCause}
+	service := Service{
+		Resolve: jobresolve.Resolver{},
+		Dump:    dumpFunc(func(context.Context, dump.Request, io.Writer) error { return nil }),
+		Stager:  failingStager{err: errors.Join(callbackErr, closeErr)},
+		Stores:  &recordingFactory{store: &uploadStore{}},
+	}
+
+	_, err := service.Run(context.Background(), "production", backupJob(t))
+	if got := errorStage(err); got != "dump_execution" {
+		t.Fatalf("Run() error stage = %q, want primary callback dump_execution", got)
+	}
+	if !errors.Is(err, callbackCause) || !errors.Is(err, closeCause) {
+		t.Fatalf("Run() error = %v, want callback and close causes", err)
+	}
+	var gotDump *dump.RunError
+	var gotCompression *stage.Error
+	if !errors.As(err, &gotDump) || gotDump != callbackErr {
+		t.Fatalf("Run() error = %v, want typed callback dump error", err)
+	}
+	if !errors.As(err, &gotCompression) || gotCompression != closeErr {
+		t.Fatalf("Run() error = %v, want typed secondary compression error", err)
+	}
+}
+
+func TestFailureStageUsesFirstAggregateBranch(t *testing.T) {
+	dumpErr := &dump.RunError{Kind: dump.FailureExecution, Err: errors.New("dump failed")}
+	compressionErr := &stage.Error{Kind: stage.FailureCompression, Err: errors.New("gzip failed")}
+
+	if got := failureStage(errors.Join(dumpErr, compressionErr)); got != "dump_execution" {
+		t.Fatalf("failureStage(dump first) = %q, want dump_execution", got)
+	}
+	if got := failureStage(errors.Join(compressionErr, dumpErr)); got != "compression" {
+		t.Fatalf("failureStage(compression first) = %q, want compression", got)
+	}
+}
+
 func TestRunUploadFailureStillRemovesArtifact(t *testing.T) {
 	uploadErr := errors.New("upload unavailable")
 	store := &uploadStore{uploadErr: uploadErr}

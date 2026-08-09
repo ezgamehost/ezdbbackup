@@ -25,6 +25,14 @@ type writeCloseErrorWriter struct {
 func (w writeCloseErrorWriter) Write([]byte) (int, error) { return 0, w.err }
 func (w writeCloseErrorWriter) Close() error              { return w.err }
 
+type callbackTestError struct{ message string }
+
+func (e *callbackTestError) Error() string { return e.message }
+
+type closeTestError struct{ message string }
+
+func (e *closeTestError) Error() string { return e.message }
+
 // This fails if staging does not create a private gzip artifact, report its
 // compressed size, or remove it on request.
 func TestStageCreatesGzipArtifactAndRemoveDeletesIt(t *testing.T) {
@@ -150,6 +158,33 @@ func TestStageClassifiesCompressionWriteFailureBeforeCallbackError(t *testing.T)
 	}
 	if !errors.Is(err, compressionErr) {
 		t.Fatalf("Stage() error = %v, want original compression cause", err)
+	}
+}
+
+func TestStagePreservesCallbackAsPrimaryWhenGzipCloseAlsoFails(t *testing.T) {
+	callbackErr := &callbackTestError{message: "dump callback failed"}
+	closeErr := &closeTestError{message: "gzip close failed"}
+	s := GzipStager{newWriter: func(io.Writer) gzipWriteCloser {
+		return closeErrorWriter{Writer: io.Discard, err: closeErr}
+	}}
+
+	_, err := s.Stage(context.Background(), t.TempDir(), func(io.Writer) error {
+		return callbackErr
+	})
+	if !errors.Is(err, callbackErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("Stage() error = %v, want callback and close causes", err)
+	}
+	var gotCallback *callbackTestError
+	if !errors.As(err, &gotCallback) || gotCallback != callbackErr {
+		t.Fatalf("Stage() error = %v, want typed callback cause", err)
+	}
+	var gotClose *closeTestError
+	if !errors.As(err, &gotClose) || gotClose != closeErr {
+		t.Fatalf("Stage() error = %v, want typed close cause", err)
+	}
+	aggregate, ok := err.(interface{ Unwrap() []error })
+	if !ok || len(aggregate.Unwrap()) != 2 || !errors.Is(aggregate.Unwrap()[0], callbackErr) {
+		t.Fatalf("Stage() error = %#v, want callback as first aggregate branch", err)
 	}
 }
 

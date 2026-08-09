@@ -82,11 +82,17 @@ func (s GzipStager) Stage(ctx context.Context, dir string, write func(io.Writer)
 	writeErr := write(writer)
 	gzipCloseErr := writer.Close()
 	fileCloseErr := file.Close()
+	if writeErr != nil {
+		if gzipCloseErr != nil {
+			return Artifact{}, errors.Join(
+				writeErr,
+				stageError(FailureCompression, fmt.Errorf("close gzip staging file: %w", gzipCloseErr)),
+			)
+		}
+		return Artifact{}, writeErr
+	}
 	if gzipCloseErr != nil {
 		return Artifact{}, stageError(FailureCompression, fmt.Errorf("close gzip staging file: %w", gzipCloseErr))
-	}
-	if writeErr != nil {
-		return Artifact{}, writeErr
 	}
 	if fileCloseErr != nil {
 		return Artifact{}, stageError(FailureTemporaryStorage, fmt.Errorf("close staging file: %w", fileCloseErr))

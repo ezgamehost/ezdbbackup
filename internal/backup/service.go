@@ -3,7 +3,6 @@ package backup
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -187,21 +186,28 @@ func errorStageOf(err error) string {
 }
 
 func failureStage(err error) string {
-	var dumpErr *dump.RunError
-	if errors.As(err, &dumpErr) {
-		if dumpErr.Kind == dump.FailureStartup {
+	switch failure := err.(type) {
+	case *dump.RunError:
+		if failure.Kind == dump.FailureStartup {
 			return "dump_startup"
 		}
 		return "dump_execution"
-	}
-	var stagingErr *stage.Error
-	if errors.As(err, &stagingErr) {
-		switch stagingErr.Kind {
+	case *stage.Error:
+		switch failure.Kind {
 		case stage.FailureCompression:
 			return "compression"
 		case stage.FailureTemporaryStorage:
 			return "temporary_storage"
 		}
+	}
+	if aggregate, ok := err.(interface{ Unwrap() []error }); ok {
+		branches := aggregate.Unwrap()
+		if len(branches) > 0 {
+			return failureStage(branches[0])
+		}
+	}
+	if wrapper, ok := err.(interface{ Unwrap() error }); ok {
+		return failureStage(wrapper.Unwrap())
 	}
 	return "dump_execution"
 }
