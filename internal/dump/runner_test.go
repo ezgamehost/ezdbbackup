@@ -97,6 +97,24 @@ func TestExecRunnerRunReportsStderrWithoutPassword(t *testing.T) {
 	}
 }
 
+// This fails if stderr is capped before password redaction, allowing a prefix
+// of the configured password to escape at the diagnostic boundary.
+func TestExecRunnerRunRedactsPasswordBeforeStderrCap(t *testing.T) {
+	password := "SensitiveToken9"
+	binary := writeFixture(t, "passwordfailure", filepath.Join(t.TempDir(), "password"), filepath.Join(t.TempDir(), "args"))
+	err := (ExecRunner{StderrLimit: 5}).Run(context.Background(), Request{
+		Binary: binary, Host: "db.internal", Port: 3307, User: "backup", Password: password, Databases: []string{"app"},
+	}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("Run() error = nil, want command failure")
+	}
+	for size := 1; size <= len(password); size++ {
+		if leaked := password[:size]; strings.Contains(err.Error(), leaked) {
+			t.Fatalf("Run() error leaked password fragment %q: %q", leaked, err)
+		}
+	}
+}
+
 // This fails if bounded stderr makes a successful dump fail with a short
 // write, or if more than the configured diagnostic budget is retained.
 func TestExecRunnerRunCapsStderrWithoutInterruptingSuccessfulDump(t *testing.T) {
@@ -138,6 +156,7 @@ func writeFixture(t *testing.T, mode, passwordPath, argsPath string) string {
 		"case " + shellQuote(mode) + " in\n" +
 		"success) printf 'dump contents\\n' ;;\n" +
 		"failure) printf 'fixture failure\\n' >&2; exit 23 ;;\n" +
+		"passwordfailure) printf '%s' \"${MYSQL_PWD}\" >&2; exit 23 ;;\n" +
 		"loudsuccess) i=0; while [ \"$i\" -lt 100 ]; do printf x >&2; i=$((i + 1)); done; printf 'dump contents\\n' ;;\n" +
 		"wait) exec sleep 10 ;;\n" +
 		"esac\n"

@@ -65,6 +65,23 @@ func TestStageRemovesPartialArtifactWhenCallbackFails(t *testing.T) {
 	}
 }
 
+// This fails if Stage suppresses a cleanup failure and leaves the caller
+// unable to detect that a sensitive partial artifact remains on disk.
+func TestStageReportsCallbackAndPartialArtifactCleanupFailures(t *testing.T) {
+	callbackErr := errors.New("write failure")
+	cleanupErr := errors.New("remove failure")
+	s := GzipStager{removeFile: func(string) error { return cleanupErr }}
+	_, err := s.Stage(context.Background(), t.TempDir(), func(io.Writer) error {
+		return callbackErr
+	})
+	if !errors.Is(err, callbackErr) {
+		t.Fatalf("Stage() error = %v, want callback failure", err)
+	}
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("Stage() error = %v, want cleanup failure", err)
+	}
+}
+
 func assertMode(t *testing.T, path string, want os.FileMode) {
 	t.Helper()
 	info, err := os.Stat(path)

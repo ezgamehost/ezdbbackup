@@ -1,6 +1,7 @@
 package dump
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -36,17 +37,19 @@ func (r ExecRunner) Probe(ctx context.Context, req Request) error {
 }
 
 func (r ExecRunner) run(ctx context.Context, req Request, args []string, dst io.Writer) error {
-	stderr := &cappedBuffer{limit: r.stderrLimit()}
+	stderr := newRedactingCappedBuffer(r.stderrLimit(), req.Password)
 	cmd := exec.CommandContext(ctx, req.Binary, args...)
 	cmd.Stdout = dst
 	cmd.Stderr = stderr
 	cmd.Env = childEnv(req.Password)
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	stderr.finish()
+	if err != nil {
 		cause := err
 		if ctx.Err() != nil {
 			cause = errors.Join(ctx.Err(), err)
 		}
-		return fmt.Errorf("mysqldump failed: %w: %s", cause, redact(stderr.String(), req.Password))
+		return fmt.Errorf("mysqldump failed: %w: %s", cause, stderr.String())
 	}
 	return nil
 }
@@ -71,13 +74,6 @@ func childEnv(password string) []string {
 	return env
 }
 
-func redact(value, secret string) string {
-	if secret == "" {
-		return value
-	}
-	return strings.ReplaceAll(value, secret, "[REDACTED]")
-}
-
 type cappedBuffer struct {
 	limit int64
 	data  []byte
@@ -97,4 +93,50 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 
 func (b *cappedBuffer) String() string {
 	return string(b.data)
+}
+
+type redactingCappedBuffer struct {
+	output  cappedBuffer
+	secret  []byte
+	pending []byte
+}
+
+func newRedactingCappedBuffer(limit int64, secret string) *redactingCappedBuffer {
+	return &redactingCappedBuffer{output: cappedBuffer{limit: limit}, secret: []byte(secret)}
+}
+
+func (b *redactingCappedBuffer) Write(p []byte) (int, error) {
+	written := len(p)
+	if len(b.secret) == 0 {
+		_, _ = b.output.Write(p)
+		return written, nil
+	}
+	for _, value := range p {
+		b.pending = append(b.pending, value)
+		b.flushCompleteSecrets()
+	}
+	return written, nil
+}
+
+func (b *redactingCappedBuffer) flushCompleteSecrets() {
+	for len(b.pending) >= len(b.secret) {
+		if bytes.HasPrefix(b.pending, b.secret) {
+			_, _ = b.output.Write([]byte("[REDACTED]"))
+			b.pending = b.pending[len(b.secret):]
+			continue
+		}
+		_, _ = b.output.Write(b.pending[:1])
+		b.pending = b.pending[1:]
+	}
+}
+
+func (b *redactingCappedBuffer) finish() {
+	if len(b.pending) > 0 {
+		_, _ = b.output.Write(b.pending)
+		b.pending = nil
+	}
+}
+
+func (b *redactingCappedBuffer) String() string {
+	return b.output.String()
 }

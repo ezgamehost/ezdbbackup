@@ -4,6 +4,7 @@ package stage
 import (
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -22,11 +23,13 @@ type Stager interface {
 }
 
 // GzipStager stores callback output in a private gzip file.
-type GzipStager struct{}
+type GzipStager struct {
+	removeFile func(string) error
+}
 
 // Stage writes a gzip-compressed artifact in dir. Every unsuccessful staging
 // attempt removes its partial file.
-func (GzipStager) Stage(ctx context.Context, dir string, write func(io.Writer) error) (artifact Artifact, err error) {
+func (s GzipStager) Stage(ctx context.Context, dir string, write func(io.Writer) error) (artifact Artifact, err error) {
 	if err := ctx.Err(); err != nil {
 		return Artifact{}, err
 	}
@@ -41,7 +44,9 @@ func (GzipStager) Stage(ctx context.Context, dir string, write func(io.Writer) e
 	success := false
 	defer func() {
 		if !success {
-			_ = os.Remove(path)
+			if removeErr := s.remove(path); removeErr != nil {
+				err = errors.Join(err, fmt.Errorf("remove partial staging file: %w", removeErr))
+			}
 		}
 	}()
 	if err := file.Chmod(0o600); err != nil {
@@ -77,4 +82,11 @@ func (GzipStager) Stage(ctx context.Context, dir string, write func(io.Writer) e
 // Remove deletes a staged artifact.
 func (GzipStager) Remove(artifact Artifact) error {
 	return os.Remove(artifact.Path)
+}
+
+func (s GzipStager) remove(path string) error {
+	if s.removeFile != nil {
+		return s.removeFile(path)
+	}
+	return os.Remove(path)
 }
