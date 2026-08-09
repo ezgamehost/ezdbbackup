@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -115,6 +116,41 @@ func TestExecRunnerRunRedactsPasswordBeforeStderrCap(t *testing.T) {
 	}
 }
 
+// This fails if stderr ending in any proper password prefix is emitted after
+// finalization, including when the prefix arrives through separate writes.
+func TestExecRunnerRunSuppressesTrailingPasswordPrefixes(t *testing.T) {
+	const password = "SensitiveToken9"
+	type testCase struct {
+		name   string
+		writes []string
+	}
+	var tests []testCase
+	for prefixLength := 1; prefixLength < len(password); prefixLength++ {
+		prefix := password[:prefixLength]
+		tests = append(tests, testCase{name: fmt.Sprintf("prefix-%d", prefixLength), writes: []string{prefix}})
+		if prefixLength > 1 {
+			tests = append(tests, testCase{name: fmt.Sprintf("prefix-%d-split", prefixLength), writes: []string{prefix[:1], prefix[1:]}})
+		}
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binary := writeStderrFailureFixture(t, tt.writes)
+			err := (ExecRunner{StderrLimit: 64}).Run(context.Background(), Request{
+				Binary: binary, Host: "db.internal", Port: 3307, User: "backup", Password: password, Databases: []string{"app"},
+			}, &bytes.Buffer{})
+			if err == nil {
+				t.Fatal("Run() error = nil, want command failure")
+			}
+			for size := 1; size < len(password); size++ {
+				if leaked := password[:size]; strings.Contains(err.Error(), leaked) {
+					t.Fatalf("Run() error leaked password prefix %q: %q", leaked, err)
+				}
+			}
+		})
+	}
+}
+
 // This fails if bounded stderr makes a successful dump fail with a short
 // write, or if more than the configured diagnostic budget is retained.
 func TestExecRunnerRunCapsStderrWithoutInterruptingSuccessfulDump(t *testing.T) {
@@ -161,6 +197,23 @@ func writeFixture(t *testing.T, mode, passwordPath, argsPath string) string {
 		"wait) exec sleep 10 ;;\n" +
 		"esac\n"
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeStderrFailureFixture(t *testing.T, writes []string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "mysqldump-stderr-fixture")
+	var script strings.Builder
+	script.WriteString("#!/bin/sh\n")
+	for _, value := range writes {
+		script.WriteString("printf '%s' ")
+		script.WriteString(shellQuote(value))
+		script.WriteString(" >&2\n")
+	}
+	script.WriteString("exit 23\n")
+	if err := os.WriteFile(path, []byte(script.String()), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return path

@@ -131,12 +131,28 @@ func (b *redactingCappedBuffer) flushCompleteSecrets() {
 }
 
 func (b *redactingCappedBuffer) finish() {
-	if len(b.pending) > 0 {
-		_, _ = b.output.Write(b.pending)
-		b.pending = nil
+	if len(b.pending) == 0 {
+		return
 	}
+	prefixLength := trailingSecretPrefixLength(b.pending, b.secret)
+	if prefixLength > 0 {
+		_, _ = b.output.Write(b.pending[:len(b.pending)-prefixLength])
+		_, _ = b.output.Write([]byte("[REDACTED]"))
+	} else {
+		_, _ = b.output.Write(b.pending)
+	}
+	b.pending = nil
 }
 
 func (b *redactingCappedBuffer) String() string {
 	return b.output.String()
+}
+
+func trailingSecretPrefixLength(value, secret []byte) int {
+	for length := min(len(value), len(secret)-1); length > 0; length-- {
+		if bytes.Equal(value[len(value)-length:], secret[:length]) {
+			return length
+		}
+	}
+	return 0
 }
