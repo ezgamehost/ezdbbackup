@@ -1,11 +1,20 @@
 package logging
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 type customCredential string
 
 func (customCredential) MarshalJSON() ([]byte, error) {
 	return []byte(`{"API_TOKEN":"hidden","safe":"visible"}`), nil
+}
+
+type textMapKey int
+
+func (textMapKey) MarshalText() ([]byte, error) {
+	return []byte("primary"), nil
 }
 
 func TestRedactRecursivelyMatchesSecretKeysCaseInsensitively(t *testing.T) {
@@ -96,5 +105,33 @@ func TestRedactTraversesCustomJSONValues(t *testing.T) {
 	custom := got["custom"].(map[string]any)
 	if custom["API_TOKEN"] != "[REDACTED]" || custom["safe"] != "visible" {
 		t.Fatalf("custom field = %#v", custom)
+	}
+}
+
+func TestRedactTraversesJSONSupportedNonStringMapKeys(t *testing.T) {
+	type credentials struct {
+		Password string `json:"password"`
+		Safe     string `json:"safe"`
+	}
+	redacted := redactFields(map[string]any{
+		"by_id":   map[int]credentials{1: {Password: "hidden", Safe: "visible"}},
+		"by_name": map[textMapKey]credentials{1: {Password: "hidden", Safe: "visible"}},
+	})
+	encoded, err := json.Marshal(redacted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	byID := got["by_id"].(map[string]any)["1"].(map[string]any)
+	if byID["password"] != "[REDACTED]" || byID["safe"] != "visible" {
+		t.Fatalf("integer-key map value = %#v", byID)
+	}
+	byName := got["by_name"].(map[string]any)["primary"].(map[string]any)
+	if byName["password"] != "[REDACTED]" || byName["safe"] != "visible" {
+		t.Fatalf("TextMarshaler-key map value = %#v", byName)
 	}
 }

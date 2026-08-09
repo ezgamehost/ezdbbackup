@@ -223,6 +223,40 @@ func TestConcurrentWritesRemainAtomicWhileForcedRotationOccurs(t *testing.T) {
 	}
 }
 
+func TestAppendLineRollsBackPartialWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "info.log")
+	initial := []byte("{\"message\":\"before\"}\n")
+	if err := os.WriteFile(path, initial, logFileMode); err != nil {
+		t.Fatal(err)
+	}
+	brokenLine := []byte("{\"message\":\"broken\"}\n")
+	err := appendLineWithWriter(path, brokenLine, logFileMode, func(file *os.File, line []byte) (int, error) {
+		written, err := file.Write(line[:len(line)/2])
+		if err != nil {
+			return written, err
+		}
+		return written, io.ErrShortWrite
+	})
+	if err == nil {
+		t.Fatal("partial write returned nil error")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(initial) {
+		t.Fatalf("log after partial write = %q, want %q", got, initial)
+	}
+
+	if err := appendLine(path, []byte("{\"message\":\"after\"}\n"), logFileMode); err != nil {
+		t.Fatal(err)
+	}
+	lines := readLogLines(t, path)
+	if len(lines) != 2 || lines[0]["message"] != "before" || lines[1]["message"] != "after" {
+		t.Fatalf("lines after recovery = %#v", lines)
+	}
+}
+
 func readLogLines(t *testing.T, path string) []map[string]any {
 	t.Helper()
 	file, err := os.Open(path)

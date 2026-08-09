@@ -189,16 +189,35 @@ func rotatedPath(path string, suffix int) string {
 }
 
 func appendLine(path string, line []byte, mode os.FileMode) error {
+	return appendLineWithWriter(path, line, mode, (*os.File).Write)
+}
+
+func appendLineWithWriter(path string, line []byte, mode os.FileMode, write func(*os.File, []byte) (int, error)) error {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, mode)
 	if err != nil {
 		return fmt.Errorf("open active log: %w", err)
 	}
-	if _, err := file.Write(line); err != nil {
+	info, err := file.Stat()
+	if err != nil {
 		file.Close()
-		return fmt.Errorf("append active log: %w", err)
+		return fmt.Errorf("stat active log before append: %w", err)
 	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close active log: %w", err)
+	written, writeErr := write(file, line)
+	if written != len(line) {
+		if writeErr == nil {
+			writeErr = io.ErrShortWrite
+		}
+		if err := file.Truncate(info.Size()); err != nil {
+			file.Close()
+			return fmt.Errorf("append active log: %w", errors.Join(writeErr, fmt.Errorf("rollback partial append: %w", err)))
+		}
+	}
+	closeErr := file.Close()
+	if writeErr != nil {
+		return fmt.Errorf("append active log: %w", writeErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close active log: %w", closeErr)
 	}
 	return nil
 }

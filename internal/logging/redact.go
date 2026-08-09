@@ -67,7 +67,7 @@ func redactReflect(value reflect.Value, depth int) any {
 			return nil
 		}
 		if value.Type().Key().Kind() != reflect.String {
-			return value.Interface()
+			return redactMarshaledValue(value.Interface(), depth)
 		}
 		redacted := make(map[string]any, value.Len())
 		iterator := value.MapRange()
