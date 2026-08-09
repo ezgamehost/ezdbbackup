@@ -19,6 +19,25 @@ type Runner interface {
 	Probe(context.Context, Request) error
 }
 
+// FailureKind identifies whether mysqldump failed to start or failed after it
+// became a running process.
+type FailureKind string
+
+const (
+	FailureStartup   FailureKind = "startup"
+	FailureExecution FailureKind = "execution"
+)
+
+// RunError classifies a mysqldump process failure and preserves its cause.
+type RunError struct {
+	Kind FailureKind
+	Err  error
+}
+
+func (e *RunError) Error() string { return fmt.Sprintf("mysqldump failed: %v", e.Err) }
+
+func (e *RunError) Unwrap() error { return e.Err }
+
 // ExecRunner invokes mysqldump as a child process. StderrLimit controls the
 // maximum stderr included in a command failure; zero selects 64 KiB.
 type ExecRunner struct {
@@ -45,11 +64,16 @@ func (r ExecRunner) run(ctx context.Context, req Request, args []string, dst io.
 	err := cmd.Run()
 	stderr.finish()
 	if err != nil {
+		kind := FailureExecution
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			kind = FailureStartup
+		}
 		cause := err
 		if ctx.Err() != nil {
 			cause = errors.Join(ctx.Err(), err)
 		}
-		return fmt.Errorf("mysqldump failed: %w: %s", cause, stderr.String())
+		return &RunError{Kind: kind, Err: fmt.Errorf("%w: %s", cause, stderr.String())}
 	}
 	return nil
 }

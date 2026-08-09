@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -95,6 +96,35 @@ func TestExecRunnerRunReportsStderrWithoutPassword(t *testing.T) {
 		t.Fatalf("Run() error = %q, want exit status and stderr", got)
 	} else if strings.Contains(got, password) {
 		t.Fatalf("Run() error disclosed password: %q", got)
+	}
+}
+
+func TestExecRunnerClassifiesProcessStartupFailure(t *testing.T) {
+	err := (ExecRunner{}).Run(context.Background(), Request{
+		Binary: filepath.Join(t.TempDir(), "missing-mysqldump"),
+	}, &bytes.Buffer{})
+	var runErr *RunError
+	if !errors.As(err, &runErr) {
+		t.Fatalf("Run() error type = %T, want *RunError", err)
+	}
+	if runErr.Kind != FailureStartup {
+		t.Fatalf("Run() failure kind = %q, want %q", runErr.Kind, FailureStartup)
+	}
+}
+
+func TestExecRunnerClassifiesProcessExecutionFailure(t *testing.T) {
+	binary := writeFixture(t, "failure", filepath.Join(t.TempDir(), "password"), filepath.Join(t.TempDir(), "args"))
+	err := (ExecRunner{}).Run(context.Background(), Request{Binary: binary}, &bytes.Buffer{})
+	var runErr *RunError
+	if !errors.As(err, &runErr) {
+		t.Fatalf("Run() error type = %T, want *RunError", err)
+	}
+	if runErr.Kind != FailureExecution {
+		t.Fatalf("Run() failure kind = %q, want %q", runErr.Kind, FailureExecution)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("Run() error = %v, want original exec.ExitError cause", err)
 	}
 }
 

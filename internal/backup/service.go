@@ -3,6 +3,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -39,20 +40,22 @@ type Result struct {
 type StageError struct {
 	Stage string
 	Err   error
+	text  string
 }
 
 func (e *StageError) Error() string {
-	return fmt.Sprintf("backup stage %s: %v", e.Stage, e.Err)
+	return fmt.Sprintf("backup stage %s: %s", e.Stage, e.text)
 }
 
 func (e *StageError) Unwrap() error { return e.Err }
 
 // Run stages, uploads, and removes one job's compressed database dump.
 func (s *Service) Run(ctx context.Context, jobName string, job config.JobConfig) (result Result, err error) {
-	started := s.now()()
+	clock := s.now()
+	started := clock()
 	var secrets []string
 	defer func() {
-		finished := s.now()()
+		finished := clock()
 		duration := finished.Sub(started)
 		if result.Job != "" {
 			result.Duration = duration
@@ -98,7 +101,7 @@ func (s *Service) Run(ctx context.Context, jobName string, job config.JobConfig)
 
 	dumpRequest, resolveErr := s.Resolve.Dump(job)
 	if resolveErr != nil {
-		return Result{}, stageError("configuration", resolveErr)
+		return Result{}, stageError("configuration", resolveErr, secrets...)
 	}
 	secrets = appendSecret(secrets, dumpRequest.Password)
 
@@ -106,15 +109,15 @@ func (s *Service) Run(ctx context.Context, jobName string, job config.JobConfig)
 		return s.Dump.Run(ctx, dumpRequest, writer)
 	})
 	if stageErr != nil {
-		return Result{}, stageError("dump_execution", stageErr)
+		return Result{}, stageError(failureStage(stageErr), stageErr, secrets...)
 	}
 	defer func() {
 		if removeErr := s.Stager.Remove(artifact); removeErr != nil {
 			if err == nil {
-				err = stageError("cleanup", removeErr)
+				err = stageError("cleanup", removeErr, secrets...)
 			} else {
 				s.write(logging.Event{
-					Time:    started,
+					Time:    clock(),
 					Level:   logging.ErrorLevel,
 					Message: "temporary backup cleanup failed",
 					Command: "backup",
@@ -126,7 +129,7 @@ func (s *Service) Run(ctx context.Context, jobName string, job config.JobConfig)
 		}
 	}()
 	s.write(logging.Event{
-		Time:    started,
+		Time:    clock(),
 		Level:   logging.InfoLevel,
 		Message: "backup staged",
 		Command: "backup",
@@ -137,7 +140,7 @@ func (s *Service) Run(ctx context.Context, jobName string, job config.JobConfig)
 
 	storageOptions, resolveErr := s.Resolve.Storage(job)
 	if resolveErr != nil {
-		return Result{}, stageError("configuration", resolveErr)
+		return Result{}, stageError("configuration", resolveErr, secrets...)
 	}
 	secrets = appendSecret(secrets, storageOptions.Credentials.AccessKeyID)
 	secrets = appendSecret(secrets, storageOptions.Credentials.SecretAccessKey)
@@ -145,11 +148,11 @@ func (s *Service) Run(ctx context.Context, jobName string, job config.JobConfig)
 
 	store, storeErr := s.Stores.New(ctx, storageOptions)
 	if storeErr != nil {
-		return Result{}, stageError("s3_upload", storeErr)
+		return Result{}, stageError("s3_upload", storeErr, secrets...)
 	}
 	objectKey := storage.ObjectKey(job.S3.Prefix, jobName, started)
 	s.write(logging.Event{
-		Time:    started,
+		Time:    clock(),
 		Level:   logging.InfoLevel,
 		Message: "backup upload started",
 		Command: "backup",
@@ -158,15 +161,15 @@ func (s *Service) Run(ctx context.Context, jobName string, job config.JobConfig)
 		Fields:  map[string]any{"object_key": objectKey, "size": artifact.Size},
 	})
 	if _, uploadErr := store.UploadFile(ctx, job.S3.Bucket, objectKey, artifact.Path); uploadErr != nil {
-		return Result{}, stageError("s3_upload", uploadErr)
+		return Result{}, stageError("s3_upload", uploadErr, secrets...)
 	}
 
 	result = Result{Job: jobName, ObjectKey: objectKey, Size: artifact.Size}
 	return result, nil
 }
 
-func stageError(stageName string, err error) error {
-	return &StageError{Stage: stageName, Err: err}
+func stageError(stageName string, err error, secrets ...string) error {
+	return &StageError{Stage: stageName, Err: err, text: safeErrorText(err, secrets)}
 }
 
 func errorStageOf(err error) string {
@@ -181,6 +184,26 @@ func errorStageOf(err error) string {
 		err = unwrapper.Unwrap()
 	}
 	return "unknown"
+}
+
+func failureStage(err error) string {
+	var dumpErr *dump.RunError
+	if errors.As(err, &dumpErr) {
+		if dumpErr.Kind == dump.FailureStartup {
+			return "dump_startup"
+		}
+		return "dump_execution"
+	}
+	var stagingErr *stage.Error
+	if errors.As(err, &stagingErr) {
+		switch stagingErr.Kind {
+		case stage.FailureCompression:
+			return "compression"
+		case stage.FailureTemporaryStorage:
+			return "temporary_storage"
+		}
+	}
+	return "dump_execution"
 }
 
 func (s *Service) now() func() time.Time {

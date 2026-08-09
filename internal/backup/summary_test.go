@@ -105,6 +105,42 @@ func TestRunManyRejectsMissingAndDisabledExplicitJobsBeforeAnyDump(t *testing.T)
 	}
 }
 
+func TestRunManyResultErrorsRedactResolvedSecretsAndPreserveCause(t *testing.T) {
+	uploadErr := errors.New("upload rejected overlap and overlap-credential")
+	service := Service{
+		Resolve: jobresolve.Resolver{},
+		Dump: dumpFunc(func(_ context.Context, _ dump.Request, writer io.Writer) error {
+			_, err := io.WriteString(writer, "SELECT 1;\n")
+			return err
+		}),
+		Stager: stage.GzipStager{},
+		Stores: &recordingFactory{store: &uploadStore{uploadErr: uploadErr}},
+	}
+	cfg := configWithJobs(t, map[string]bool{"production": true})
+	job := cfg.Jobs["production"]
+	job.MySQL.Password = "mysql-sensitive"
+	job.S3.AccessKeyID = "overlap"
+	job.S3.SecretAccessKey = "overlap-credential"
+	cfg.Jobs["production"] = job
+
+	summary := service.RunMany(context.Background(), cfg, nil)
+	if len(summary.Results) != 1 {
+		t.Fatalf("summary results = %d, want 1", len(summary.Results))
+	}
+	err := summary.Results[0].Err
+	if !errors.Is(err, uploadErr) {
+		t.Fatalf("summary error = %v, want original upload cause", err)
+	}
+	if got := err.Error(); got != "backup stage s3_upload: upload rejected [REDACTED] and [REDACTED]" {
+		t.Fatalf("summary error = %q, want complete redaction", got)
+	}
+	for _, secret := range []string{"mysql-sensitive", "overlap", "overlap-credential"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("summary error contains secret %q: %v", secret, err)
+		}
+	}
+}
+
 func summaryRecordingService(order *[]string) Service {
 	return Service{
 		Resolve: jobresolve.Resolver{},

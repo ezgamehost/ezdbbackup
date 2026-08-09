@@ -11,6 +11,20 @@ import (
 	"testing"
 )
 
+type closeErrorWriter struct {
+	io.Writer
+	err error
+}
+
+func (w closeErrorWriter) Close() error { return w.err }
+
+type writeCloseErrorWriter struct {
+	err error
+}
+
+func (w writeCloseErrorWriter) Write([]byte) (int, error) { return 0, w.err }
+func (w writeCloseErrorWriter) Close() error              { return w.err }
+
 // This fails if staging does not create a private gzip artifact, report its
 // compressed size, or remove it on request.
 func TestStageCreatesGzipArtifactAndRemoveDeletesIt(t *testing.T) {
@@ -79,6 +93,63 @@ func TestStageReportsCallbackAndPartialArtifactCleanupFailures(t *testing.T) {
 	}
 	if !errors.Is(err, cleanupErr) {
 		t.Fatalf("Stage() error = %v, want cleanup failure", err)
+	}
+}
+
+func TestStageClassifiesTemporaryStorageFailure(t *testing.T) {
+	notDirectory := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notDirectory, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := (GzipStager{}).Stage(context.Background(), notDirectory, func(io.Writer) error { return nil })
+	var stageErr *Error
+	if !errors.As(err, &stageErr) {
+		t.Fatalf("Stage() error type = %T, want *Error", err)
+	}
+	if stageErr.Kind != FailureTemporaryStorage {
+		t.Fatalf("Stage() failure kind = %q, want %q", stageErr.Kind, FailureTemporaryStorage)
+	}
+}
+
+func TestStageClassifiesCompressionFailure(t *testing.T) {
+	compressionErr := errors.New("compressor close failed")
+	s := GzipStager{newWriter: func(writer io.Writer) gzipWriteCloser {
+		return closeErrorWriter{Writer: writer, err: compressionErr}
+	}}
+
+	_, err := s.Stage(context.Background(), t.TempDir(), func(writer io.Writer) error {
+		_, writeErr := io.WriteString(writer, "database dump")
+		return writeErr
+	})
+	var stageErr *Error
+	if !errors.As(err, &stageErr) {
+		t.Fatalf("Stage() error type = %T, want *Error", err)
+	}
+	if stageErr.Kind != FailureCompression {
+		t.Fatalf("Stage() failure kind = %q, want %q", stageErr.Kind, FailureCompression)
+	}
+	if !errors.Is(err, compressionErr) {
+		t.Fatalf("Stage() error = %v, want original compression cause", err)
+	}
+}
+
+func TestStageClassifiesCompressionWriteFailureBeforeCallbackError(t *testing.T) {
+	compressionErr := errors.New("compressor write failed")
+	s := GzipStager{newWriter: func(io.Writer) gzipWriteCloser {
+		return writeCloseErrorWriter{err: compressionErr}
+	}}
+
+	_, err := s.Stage(context.Background(), t.TempDir(), func(writer io.Writer) error {
+		_, writeErr := io.WriteString(writer, "database dump")
+		return writeErr
+	})
+	var stageErr *Error
+	if !errors.As(err, &stageErr) || stageErr.Kind != FailureCompression {
+		t.Fatalf("Stage() error = %v, want typed compression failure", err)
+	}
+	if !errors.Is(err, compressionErr) {
+		t.Fatalf("Stage() error = %v, want original compression cause", err)
 	}
 }
 

@@ -32,6 +32,12 @@ type memorySink struct {
 	events []logging.Event
 }
 
+type typedServiceError struct {
+	message string
+}
+
+func (e *typedServiceError) Error() string { return e.message }
+
 func (s *memorySink) Write(event logging.Event) error {
 	s.events = append(s.events, event)
 	return nil
@@ -96,6 +102,16 @@ type removeErrorStager struct {
 	stage.GzipStager
 	err error
 }
+
+type failingStager struct {
+	err error
+}
+
+func (s failingStager) Stage(context.Context, string, func(io.Writer) error) (stage.Artifact, error) {
+	return stage.Artifact{}, s.err
+}
+
+func (failingStager) Remove(stage.Artifact) error { return nil }
 
 func (s removeErrorStager) Remove(artifact stage.Artifact) error {
 	removeErr := s.GzipStager.Remove(artifact)
@@ -209,6 +225,48 @@ func TestRunStagesAndUploadsDumpThenRemovesArtifact(t *testing.T) {
 	}
 }
 
+func TestRunUsesInjectedClockForEveryTransitionEvent(t *testing.T) {
+	base := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	times := []time.Time{
+		base,
+		base.Add(time.Second),
+		base.Add(2 * time.Second),
+		base.Add(3 * time.Second),
+	}
+	logs := &memorySink{}
+	service := successfulService(t, &uploadStore{}, stage.GzipStager{}, logs)
+	service.Now = clockFromTimes(t, times)
+
+	result, err := service.Run(context.Background(), "production", backupJob(t))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	wantEvents := []struct {
+		message string
+		time    time.Time
+	}{
+		{message: "backup started", time: times[0]},
+		{message: "backup staged", time: times[1]},
+		{message: "backup upload started", time: times[2]},
+		{message: "backup completed", time: times[3]},
+	}
+	if len(logs.events) != len(wantEvents) {
+		t.Fatalf("event count = %d, want %d: %#v", len(logs.events), len(wantEvents), logs.events)
+	}
+	for i, want := range wantEvents {
+		if got := logs.events[i]; got.Message != want.message || !got.Time.Equal(want.time) {
+			t.Fatalf("event[%d] = message:%q time:%s, want message:%q time:%s", i, got.Message, got.Time, want.message, want.time)
+		}
+	}
+	if result.Duration != 3*time.Second {
+		t.Fatalf("Run() duration = %s, want 3s from initial start to final transition", result.Duration)
+	}
+	wantKey := "production/2026/08/09/production-20260809T120000.000000000Z.sql.gz"
+	if result.ObjectKey != wantKey {
+		t.Fatalf("Run() object key = %q, want key from initial start %q", result.ObjectKey, wantKey)
+	}
+}
+
 func TestRunDumpFailurePreventsStoreCreationAndUpload(t *testing.T) {
 	dumpErr := errors.New("mysqldump exited 2")
 	store := &uploadStore{}
@@ -231,6 +289,69 @@ func TestRunDumpFailurePreventsStoreCreationAndUpload(t *testing.T) {
 	}
 	if len(factory.options) != 0 || store.calls != 0 {
 		t.Fatalf("storage after dump failure = factory:%d upload:%d, want none", len(factory.options), store.calls)
+	}
+}
+
+func TestRunClassifiesDumpAndStagingBoundaryFailures(t *testing.T) {
+	tests := []struct {
+		name      string
+		cause     error
+		wantStage string
+		stager    stage.Stager
+	}{
+		{
+			name:      "dump startup",
+			cause:     errors.New("executable missing"),
+			wantStage: "dump_startup",
+		},
+		{
+			name:      "dump execution",
+			cause:     errors.New("mysqldump exited"),
+			wantStage: "dump_execution",
+		},
+		{
+			name:      "compression",
+			cause:     errors.New("gzip close failed"),
+			wantStage: "compression",
+		},
+		{
+			name:      "temporary storage",
+			cause:     errors.New("create staging file failed"),
+			wantStage: "temporary_storage",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			boundaryErr := tt.cause
+			stager := tt.stager
+			runnerErr := boundaryErr
+			switch tt.wantStage {
+			case "dump_startup":
+				runnerErr = &dump.RunError{Kind: dump.FailureStartup, Err: boundaryErr}
+				stager = stage.GzipStager{}
+			case "dump_execution":
+				runnerErr = &dump.RunError{Kind: dump.FailureExecution, Err: boundaryErr}
+				stager = stage.GzipStager{}
+			case "compression":
+				stager = failingStager{err: &stage.Error{Kind: stage.FailureCompression, Err: boundaryErr}}
+			case "temporary_storage":
+				stager = failingStager{err: &stage.Error{Kind: stage.FailureTemporaryStorage, Err: boundaryErr}}
+			}
+			service := Service{
+				Resolve: jobresolve.Resolver{},
+				Dump:    dumpFunc(func(context.Context, dump.Request, io.Writer) error { return runnerErr }),
+				Stager:  stager,
+				Stores:  &recordingFactory{store: &uploadStore{}},
+			}
+
+			_, err := service.Run(context.Background(), "production", backupJob(t))
+			if got := errorStage(err); got != tt.wantStage {
+				t.Fatalf("Run() error stage = %q, want %q", got, tt.wantStage)
+			}
+			if !errors.Is(err, boundaryErr) {
+				t.Fatalf("Run() error = %v, want original boundary cause", err)
+			}
+		})
 	}
 }
 
@@ -274,6 +395,9 @@ func TestRunCleanupFailureDoesNotMaskUploadFailure(t *testing.T) {
 	store := &uploadStore{uploadErr: uploadErr}
 	logs := &memorySink{}
 	service := successfulService(t, store, removeErrorStager{err: cleanupErr}, logs)
+	base := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	times := []time.Time{base, base.Add(time.Second), base.Add(2 * time.Second), base.Add(3 * time.Second), base.Add(4 * time.Second)}
+	service.Now = clockFromTimes(t, times)
 
 	_, err := service.Run(context.Background(), "production", backupJob(t))
 	if !errors.Is(err, uploadErr) {
@@ -283,18 +407,31 @@ func TestRunCleanupFailureDoesNotMaskUploadFailure(t *testing.T) {
 		t.Fatalf("Run() error = %v, must not include later cleanup error", err)
 	}
 	foundCleanupLog := false
+	foundFailureLog := false
 	for _, event := range logs.events {
 		if event.Job == "production" && event.Stage == "cleanup" && event.Level == logging.ErrorLevel {
 			foundCleanupLog = true
+			if !event.Time.Equal(times[3]) {
+				t.Fatalf("cleanup event time = %s, want injected time %s", event.Time, times[3])
+			}
+		}
+		if event.Message == "backup failed" {
+			foundFailureLog = true
+			if !event.Time.Equal(times[4]) {
+				t.Fatalf("failure event time = %s, want injected time %s", event.Time, times[4])
+			}
 		}
 	}
 	if !foundCleanupLog {
 		t.Fatalf("cleanup failure log not found: %#v", logs.events)
 	}
+	if !foundFailureLog {
+		t.Fatalf("backup failure log not found: %#v", logs.events)
+	}
 }
 
 func TestRunRedactsOverlappingSecretsFromFailureLogs(t *testing.T) {
-	uploadErr := errors.New("upload rejected overlap and overlap-credential")
+	uploadErr := &typedServiceError{message: "upload rejected overlap and overlap-credential"}
 	store := &uploadStore{uploadErr: uploadErr}
 	logs := &memorySink{}
 	service := successfulService(t, store, stage.GzipStager{}, logs)
@@ -302,7 +439,17 @@ func TestRunRedactsOverlappingSecretsFromFailureLogs(t *testing.T) {
 	job.S3.AccessKeyID = "overlap"
 	job.S3.SecretAccessKey = "overlap-credential"
 
-	_, _ = service.Run(context.Background(), "production", job)
+	_, err := service.Run(context.Background(), "production", job)
+	if !errors.Is(err, uploadErr) {
+		t.Fatalf("Run() error = %v, want original upload cause", err)
+	}
+	var typedErr *typedServiceError
+	if !errors.As(err, &typedErr) || typedErr != uploadErr {
+		t.Fatalf("Run() error = %v, want original typed upload cause", err)
+	}
+	if got := err.Error(); got != "backup stage s3_upload: upload rejected [REDACTED] and [REDACTED]" {
+		t.Fatalf("Run() error = %q, want complete redaction", got)
+	}
 	for _, event := range logs.events {
 		if event.Message != "backup failed" {
 			continue
@@ -362,4 +509,17 @@ func assertCompletionEvent(t *testing.T, events []logging.Event, result Result) 
 		return
 	}
 	t.Fatalf("completion event not found: %#v", events)
+}
+
+func clockFromTimes(t *testing.T, times []time.Time) func() time.Time {
+	t.Helper()
+	index := 0
+	return func() time.Time {
+		if index >= len(times) {
+			t.Fatalf("clock called %d times, only %d values provided", index+1, len(times))
+		}
+		value := times[index]
+		index++
+		return value
+	}
 }
