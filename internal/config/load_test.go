@@ -65,6 +65,50 @@ jobs:
 	}
 }
 
+func TestDecodePreservesExplicitZeroValuesForValidation(t *testing.T) {
+	input := `
+version: 1
+logging:
+  rotation:
+    max_size_mb: 0
+    max_files: 0
+    max_age_days: 0
+jobs:
+  production:
+    enabled: true
+    schedule: "0 2 * * *"
+    run_as: root
+    mysql:
+      host: db.internal
+      port: 0
+      user: backup
+      databases: all
+    s3:
+      bucket: backups
+      region: us-east-1
+`
+
+	cfg, findings := Decode(strings.NewReader(input))
+	if findings.HasErrors() {
+		t.Fatalf("Decode() findings = %v", findings)
+	}
+	if got := cfg.Logging.Rotation.MaxSizeMB; got != 0 {
+		t.Fatalf("MaxSizeMB = %d, want explicit zero", got)
+	}
+	if got := cfg.Logging.Rotation.MaxFiles; got != 0 {
+		t.Fatalf("MaxFiles = %d, want explicit zero", got)
+	}
+	if got := cfg.Logging.Rotation.MaxAgeDays; got != 0 {
+		t.Fatalf("MaxAgeDays = %d, want explicit zero", got)
+	}
+	if got := cfg.Jobs["production"].MySQL.Port; got != 0 {
+		t.Fatalf("port = %d, want explicit zero", got)
+	}
+	if findings := Validate(cfg); !findings.HasErrors() {
+		t.Fatalf("Validate() findings = %v, want errors for explicit zero values", findings)
+	}
+}
+
 func TestDecodeRejectsInvalidYAMLDocuments(t *testing.T) {
 	tests := []struct {
 		name  string

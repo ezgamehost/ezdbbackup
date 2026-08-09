@@ -41,16 +41,52 @@ func Decode(r io.Reader) (*Config, Findings) {
 		return nil, Findings{{Message: "configuration must contain exactly one YAML document"}}
 	}
 
-	compressConfigured, err := yamlPathExists(b, "logging", "rotation", "compress")
+	presence, err := defaultFieldPresence(b, cfg.JobNames())
 	if err != nil {
 		return nil, Findings{{Message: fmt.Sprintf("decode configuration: %v", err)}}
 	}
-	applyDefaults(&cfg, compressConfigured)
+	applyDefaults(&cfg, presence)
 	normalizePrefixes(&cfg)
 	return &cfg, nil
 }
 
-func applyDefaults(cfg *Config, compressConfigured bool) {
+type defaultPresence struct {
+	rotationMaxSizeMB  bool
+	rotationMaxFiles   bool
+	rotationMaxAgeDays bool
+	rotationCompress   bool
+	mysqlPorts         map[string]bool
+}
+
+func defaultFieldPresence(data []byte, jobNames []string) (defaultPresence, error) {
+	presence := defaultPresence{mysqlPorts: make(map[string]bool, len(jobNames))}
+	paths := []struct {
+		path  []string
+		found *bool
+	}{
+		{path: []string{"logging", "rotation", "max_size_mb"}, found: &presence.rotationMaxSizeMB},
+		{path: []string{"logging", "rotation", "max_files"}, found: &presence.rotationMaxFiles},
+		{path: []string{"logging", "rotation", "max_age_days"}, found: &presence.rotationMaxAgeDays},
+		{path: []string{"logging", "rotation", "compress"}, found: &presence.rotationCompress},
+	}
+	for _, item := range paths {
+		found, err := yamlPathExists(data, item.path...)
+		if err != nil {
+			return defaultPresence{}, err
+		}
+		*item.found = found
+	}
+	for _, name := range jobNames {
+		found, err := yamlPathExists(data, "jobs", name, "mysql", "port")
+		if err != nil {
+			return defaultPresence{}, err
+		}
+		presence.mysqlPorts[name] = found
+	}
+	return presence, nil
+}
+
+func applyDefaults(cfg *Config, presence defaultPresence) {
 	if cfg.Defaults.DumpBinary == "" {
 		cfg.Defaults.DumpBinary = defaultDumpBinary
 	}
@@ -60,16 +96,16 @@ func applyDefaults(cfg *Config, compressConfigured bool) {
 	if cfg.Logging.Directory == "" {
 		cfg.Logging.Directory = defaultLogDir
 	}
-	if cfg.Logging.Rotation.MaxSizeMB == 0 {
+	if !presence.rotationMaxSizeMB {
 		cfg.Logging.Rotation.MaxSizeMB = 100
 	}
-	if cfg.Logging.Rotation.MaxFiles == 0 {
+	if !presence.rotationMaxFiles {
 		cfg.Logging.Rotation.MaxFiles = 7
 	}
-	if cfg.Logging.Rotation.MaxAgeDays == 0 {
+	if !presence.rotationMaxAgeDays {
 		cfg.Logging.Rotation.MaxAgeDays = 30
 	}
-	if !compressConfigured {
+	if !presence.rotationCompress {
 		cfg.Logging.Rotation.Compress = true
 	}
 	for name, job := range cfg.Jobs {
@@ -79,7 +115,7 @@ func applyDefaults(cfg *Config, compressConfigured bool) {
 		if job.TempDir == "" {
 			job.TempDir = cfg.Defaults.TempDir
 		}
-		if job.MySQL.Port == 0 {
+		if !presence.mysqlPorts[name] {
 			job.MySQL.Port = 3306
 		}
 		cfg.Jobs[name] = job

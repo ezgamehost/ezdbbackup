@@ -69,8 +69,17 @@ func validateJob(findings *Findings, name string, job JobConfig) {
 	if strings.TrimSpace(job.MySQL.User) == "" {
 		findings.addError(base+".mysql.user", "is required")
 	}
-	if !job.MySQL.Databases.All && len(job.MySQL.Databases.Names) == 0 {
+	databases := job.MySQL.Databases
+	if databases.All && len(databases.Names) > 0 {
+		findings.addError(base+".mysql.databases", "must select either all databases or an explicit list")
+	} else if !databases.All && len(databases.Names) == 0 {
 		findings.addError(base+".mysql.databases", "is required")
+	} else if !databases.All {
+		for i, name := range databases.Names {
+			if name == "" {
+				findings.addError(fmt.Sprintf("%s.mysql.databases[%d]", base, i), "must not be empty")
+			}
+		}
 	}
 	validateSecretRef(findings, base+".mysql.password", job.MySQL.PasswordRef())
 	for i, arg := range job.MySQL.ExtraArgs {
@@ -146,14 +155,20 @@ func conflictingDumpArgument(arg string) bool {
 			return true
 		}
 	}
-	if arg == "-r" || strings.HasPrefix(arg, "-r") ||
-		arg == "-h" || strings.HasPrefix(arg, "-h") ||
-		arg == "-P" || strings.HasPrefix(arg, "-P") ||
-		arg == "-u" || strings.HasPrefix(arg, "-u") ||
-		arg == "-p" || strings.HasPrefix(arg, "-p") ||
-		arg == "-A" || strings.HasPrefix(arg, "-A") ||
-		arg == "-B" || strings.HasPrefix(arg, "-B") {
+	if containsManagedShortOption(arg) {
 		return true
+	}
+	return false
+}
+
+func containsManagedShortOption(arg string) bool {
+	if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") {
+		return false
+	}
+	for _, option := range "rhPupAB" {
+		if strings.ContainsRune(arg[1:], option) {
+			return true
+		}
 	}
 	return false
 }

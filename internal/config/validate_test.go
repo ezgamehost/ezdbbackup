@@ -33,6 +33,11 @@ func TestValidateRejectsInvalidConfiguration(t *testing.T) {
 			j.MySQL.Databases = DatabaseSelection{}
 			c.Jobs["production"] = j
 		}},
+		{"ambiguous database scope", func(c *Config) {
+			j := c.Jobs["production"]
+			j.MySQL.Databases = DatabaseSelection{All: true, Names: []string{"app"}}
+			c.Jobs["production"] = j
+		}},
 		{"both password forms", func(c *Config) {
 			j := c.Jobs["production"]
 			j.MySQL.Password = "secret"
@@ -71,6 +76,32 @@ func TestValidateRejectsInvalidConfiguration(t *testing.T) {
 			tt.edit(cfg)
 			if findings := Validate(cfg); !findings.HasErrors() {
 				t.Fatalf("Validate() findings = %v, want errors", findings)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsClustersWithManagedShortOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		arg  string
+	}{
+		{name: "output", arg: "-vr/tmp/dump"},
+		{name: "host", arg: "-vhdb.other"},
+		{name: "port", arg: "-vP3307"},
+		{name: "user", arg: "-vuother"},
+		{name: "password", arg: "-vpsecret"},
+		{name: "all databases", arg: "-vA"},
+		{name: "databases", arg: "-vB"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			job := cfg.Jobs["production"]
+			job.MySQL.ExtraArgs = []string{tt.arg}
+			cfg.Jobs["production"] = job
+			if findings := Validate(cfg); !findings.HasErrors() {
+				t.Fatalf("Validate() findings = %v, want error for %q", findings, tt.arg)
 			}
 		})
 	}
