@@ -3,20 +3,23 @@ package storage
 import (
 	"context"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
+
+const transferFailureTimeout = 30 * time.Second
 
 type headBucketAPI interface {
 	HeadBucket(context.Context, *s3.HeadBucketInput, ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
 }
 
 type uploadAPI interface {
-	Upload(context.Context, *s3.PutObjectInput, ...func(*manager.Uploader)) (*manager.UploadOutput, error)
+	UploadObject(context.Context, *transfermanager.UploadObjectInput, ...func(*transfermanager.Options)) (*transfermanager.UploadObjectOutput, error)
 }
 
 type AWSFactory struct{}
@@ -45,10 +48,14 @@ func (AWSFactory) New(ctx context.Context, opts Options) (Store, error) {
 		}
 		o.UsePathStyle = opts.ForcePathStyle
 	})
-	uploader := manager.NewUploader(client, func(u *manager.Uploader) {
-		u.LeavePartsOnError = false
-	})
+	uploader := newTransferManager(client)
 	return &s3Store{client: client, uploader: uploader}, nil
+}
+
+func newTransferManager(client transfermanager.S3APIClient) uploadAPI {
+	return transfermanager.New(client, func(options *transfermanager.Options) {
+		options.FailTimeout = transferFailureTimeout
+	})
 }
 
 type s3Store struct {
@@ -63,7 +70,7 @@ func (s *s3Store) UploadFile(ctx context.Context, bucket, key, path string) (Upl
 	}
 	defer file.Close()
 
-	output, err := s.uploader.Upload(ctx, &s3.PutObjectInput{
+	output, err := s.uploader.UploadObject(ctx, &transfermanager.UploadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 		Body:   file,
@@ -72,7 +79,7 @@ func (s *s3Store) UploadFile(ctx context.Context, bucket, key, path string) (Upl
 		return UploadResult{}, err
 	}
 	return UploadResult{
-		Location: output.Location,
+		Location: aws.ToString(output.Location),
 		ETag:     aws.ToString(output.ETag),
 	}, nil
 }
