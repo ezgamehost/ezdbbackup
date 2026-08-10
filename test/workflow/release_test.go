@@ -41,6 +41,7 @@ type job struct {
 
 type step struct {
 	Name            string         `yaml:"name"`
+	ID              string         `yaml:"id"`
 	Uses            string         `yaml:"uses"`
 	With            map[string]any `yaml:"with"`
 	Run             string         `yaml:"run"`
@@ -92,7 +93,7 @@ func (decoded *job) UnmarshalYAML(node *yaml.Node) error {
 }
 
 func (decoded *step) UnmarshalYAML(node *yaml.Node) error {
-	if err := requireOnlyMappingKeys(node, "release step", "name", "uses", "with", "run", "if", "continue-on-error", "env"); err != nil {
+	if err := requireOnlyMappingKeys(node, "release step", "name", "id", "uses", "with", "run", "if", "continue-on-error", "env"); err != nil {
 		return err
 	}
 	type plainStep step
@@ -185,7 +186,7 @@ func TestReleasePublishDependsOnEveryVerificationGate(t *testing.T) {
 	}
 
 	gates := []string{"unit", "vet", "race", "static-build", "integration"}
-	allJobs := append(append([]string(nil), gates...), "publish")
+	allJobs := append(append([]string(nil), gates...), "publish", "apt-publish")
 	jobNames := make([]string, 0, len(release.Jobs))
 	for name := range release.Jobs {
 		jobNames = append(jobNames, name)
@@ -214,6 +215,55 @@ func TestReleasePublishDependsOnEveryVerificationGate(t *testing.T) {
 	if len(publish.Steps) != 3 {
 		t.Fatalf("publish steps = %d, want download, checksum, and publish only", len(publish.Steps))
 	}
+}
+
+func TestReleasePublishesExactlyTwoDebianPackagesToPinnedAptAction(t *testing.T) {
+	release := loadReleaseWorkflow(t)
+	aptPublish, ok := release.Jobs["apt-publish"]
+	if !ok {
+		t.Fatal("release workflow has no apt-publish job")
+	}
+	if aptPublish.RunsOn != "ubuntu-latest" || aptPublish.TimeoutMinutes != 10 {
+		t.Fatalf("apt-publish runner/timeout = %q/%d, want ubuntu-latest/10", aptPublish.RunsOn, aptPublish.TimeoutMinutes)
+	}
+	assertExactPermission(t, "apt-publish", aptPublish.Permissions, "contents", "write")
+	assertJobCannotIgnoreFailures(t, "apt-publish", aptPublish)
+	assertExactStrings(t, "apt-publish.needs", []string(aptPublish.Needs), []string{"publish"})
+	if len(aptPublish.Environment) != 0 {
+		t.Fatalf("apt-publish has unapproved job environment: %v", aptPublish.Environment)
+	}
+
+	const resolvePackages = `set -euo pipefail
+version="${GITHUB_REF_NAME#v}"
+[[ "${version}" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]
+amd64="dist/ezdbbackup_${version}_amd64.deb"
+arm64="dist/ezdbbackup_${version}_arm64.deb"
+[[ -f "${amd64}" && ! -L "${amd64}" ]]
+[[ -f "${arm64}" && ! -L "${arm64}" ]]
+{
+  echo 'files<<EZDBBACKUP_PACKAGES'
+  printf '%s\n' "${amd64}" "${arm64}"
+  echo 'EZDBBACKUP_PACKAGES'
+} >>"${GITHUB_OUTPUT}"`
+	const actionSHA = "8c24b79cdad7db0acf6f321d31aae831e4130196"
+	assertExactSteps(t, "apt-publish", aptPublish, []step{
+		{
+			Name: "Download verified release artifacts", Uses: "actions/download-artifact@v4",
+			With: map[string]any{"name": "release-dist", "path": "dist"},
+		},
+		{Name: "Verify packaged checksums", Run: "cd dist && sha256sum -c SHA256SUMS"},
+		{Name: "Resolve Debian package paths", ID: "packages", Run: resolvePackages},
+		{
+			Name: "Publish Debian packages to the EZ Game Host APT repository",
+			Uses: "ezgamehost/apt-repo-infra/.github/actions/publish@" + actionSHA,
+			With: map[string]any{
+				"release-tag":   "${{ github.ref_name }}",
+				"package-files": "${{ steps.packages.outputs.files }}",
+				"github-token":  "${{ github.token }}",
+				"infra-token":   "${{ secrets.APT_REPOSITORY_DISPATCH_TOKEN }}",
+			},
+		},
+	})
 }
 
 func TestReleaseVerificationJobsExerciseRequiredBoundaries(t *testing.T) {

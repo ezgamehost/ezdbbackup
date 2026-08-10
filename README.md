@@ -22,6 +22,41 @@ responsibilities.
 
 ## Install
 
+### APT repository (Debian and Ubuntu)
+
+The EZ Game Host APT repository supports Linux `amd64` and `arm64`. Install its
+dedicated archive key only after verifying the full fingerprint:
+
+```sh
+key_tmp="$(mktemp)"
+curl -fsSL https://packages.ezghcloud.com/keys/ez-game-host-archive-keyring.asc -o "${key_tmp}"
+fingerprint="$(gpg --show-keys --with-colons "${key_tmp}" | awk -F: '$1 == "fpr" {print $10; exit}')"
+if [ "${fingerprint}" != "ABD25D98B108D34E1BDA4CF6FD22EEB49867BCC6" ]; then
+  echo "EZ Game Host archive-key fingerprint mismatch" >&2
+  exit 1
+fi
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo install -m 0644 "${key_tmp}" /etc/apt/keyrings/ez-game-host-archive-keyring.asc
+rm -f "${key_tmp}"
+```
+
+Configure the repository with a deb822 source restricted to that key, then
+install normally with APT:
+
+```sh
+sudo tee /etc/apt/sources.list.d/ez-game-host.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://packages.ezghcloud.com/apt
+Suites: stable
+Components: main
+Signed-By: /etc/apt/keyrings/ez-game-host-archive-keyring.asc
+EOF
+sudo apt-get update
+sudo apt-get install ezdbbackup
+```
+
+### Manual archive install
+
 Download the archive for the host architecture and verify it against the
 release's `SHA256SUMS`. Each archive contains `ezdbbackup`, this README, and
 `config.example.yml`.
