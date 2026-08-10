@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -92,30 +93,91 @@ func TestUploaderMultipartUsesOrderedBoundedSeekableParts(t *testing.T) {
 
 func TestMultipartPlanUsesLegalDynamicSizingAndAtMostTenThousandParts(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		size      int64
-		wantParts int
+		name         string
+		size         int64
+		wantPartSize int64
+		wantParts    int
 	}{
-		{name: "one above ten thousand minimum parts", size: (5<<20)*10_000 + 1, wantParts: 10_000},
-		{name: "maximum object", size: 5 << 40, wantParts: 10_000},
+		{
+			name:         "one above ten thousand minimum parts",
+			size:         (5<<20)*10_000 + 1,
+			wantPartSize: 5_242_881,
+			wantParts:    10_000,
+		},
+		{
+			name:         "maximum object",
+			size:         53_687_091_200_000,
+			wantPartSize: 5_368_709_120,
+			wantParts:    10_000,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			partSize, partCount, err := multipartPlan(test.size, 5<<20)
 			if err != nil {
 				t.Fatalf("multipartPlan() error = %v", err)
 			}
-			if partSize < 5<<20 || partSize > 5<<30 || partCount != test.wantParts || partCount > 10_000 {
-				t.Fatalf("multipartPlan(%d) = size:%d count:%d, want legal count %d", test.size, partSize, partCount, test.wantParts)
+			if partSize != test.wantPartSize || partCount != test.wantParts {
+				t.Fatalf("multipartPlan(%d) = size:%d count:%d, want size:%d count:%d", test.size, partSize, partCount, test.wantPartSize, test.wantParts)
 			}
 			if (int64(partCount)-1)*partSize >= test.size || int64(partCount)*partSize < test.size {
 				t.Fatalf("multipart plan does not cover size exactly: size=%d partSize=%d count=%d", test.size, partSize, partCount)
 			}
 		})
 	}
-	for _, size := range []int64{-1, (5 << 40) + 1} {
+	for _, size := range []int64{-1, 53_687_091_200_001, math.MaxInt64} {
 		if _, _, err := multipartPlan(size, 5<<20); err == nil {
 			t.Fatalf("multipartPlan(%d) error = nil", size)
 		}
+	}
+}
+
+// This fails if ceiling division is changed to the overflowing
+// (value+divisor-1)/divisor form.
+func TestDivideRoundUpDoesNotOverflowAtInt64Boundary(t *testing.T) {
+	if got, want := divideRoundUp(math.MaxInt64, 10_000), int64(922_337_203_685_478); got != want {
+		t.Fatalf("divideRoundUp(MaxInt64, 10000) = %d, want %d", got, want)
+	}
+}
+
+func TestUploaderEnforcesMultipartObjectSizeBoundaryBeforeS3DataTransfer(t *testing.T) {
+	const maximum = int64(53_687_091_200_000)
+	createErr := errors.New("controlled create failure")
+	client := &fakeS3API{createErr: createErr}
+	uploader := newFileUploader(client)
+
+	_, err := uploader.Upload(context.Background(), "backups", "largest.sql.gz", bytes.NewReader(nil), maximum)
+	if !errors.Is(err, createErr) {
+		t.Fatalf("Upload(maximum) error = %v, want CreateMultipartUpload cause", err)
+	}
+	if got := len(client.createInputs); got != 1 {
+		t.Fatalf("CreateMultipartUpload(maximum) calls = %d, want 1", got)
+	}
+
+	client = &fakeS3API{}
+	uploader = newFileUploader(client)
+	if _, err := uploader.Upload(context.Background(), "backups", "too-large.sql.gz", bytes.NewReader(nil), maximum+1); err == nil {
+		t.Fatal("Upload(maximum+1) error = nil")
+	}
+	if len(client.putInputs) != 0 || len(client.createInputs) != 0 {
+		t.Fatalf("S3 calls for maximum+1 = put:%d create:%d, want none", len(client.putInputs), len(client.createInputs))
+	}
+}
+
+// This fails if an incomplete CreateMultipartUpload response causes an abort
+// request that cannot identify any server-side upload.
+func TestUploaderDoesNotAbortWithoutMultipartUploadID(t *testing.T) {
+	client := &fakeS3API{createOutput: &s3.CreateMultipartUploadOutput{}}
+	uploader := newFileUploader(client)
+
+	_, err := uploader.Upload(context.Background(), "backups", "large.sql.gz", bytes.NewReader(make([]byte, 9<<20)), 9<<20)
+	if err == nil {
+		t.Fatal("Upload() error = nil")
+	}
+	if got := err.Error(); !strings.Contains(got, "missing upload id") {
+		t.Fatalf("Upload() error = %q, want fixed safe missing-upload-ID reason", got)
+	}
+	if got := len(client.abortInputs); got != 0 {
+		t.Fatalf("AbortMultipartUpload() calls = %d, want none without an upload ID", got)
 	}
 }
 

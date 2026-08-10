@@ -231,15 +231,21 @@ s3:
 Without a custom endpoint, bucket names use AWS's 3-63 character DNS-compatible
 grammar and reserved AWS prefixes/suffixes are rejected. Custom endpoints use a
 conservative single-segment ASCII bucket grammar (uppercase and `_` are also
-accepted). Regions are bounded lowercase identifiers without empty components.
+accepted). The account-regional general-purpose bucket suffix `-an` is not
+blanket-rejected for AWS or compatible custom endpoints. Regions are bounded
+lowercase identifiers without empty components.
 Prefixes must be valid terminal-safe UTF-8, contain no relative `.`/`..`
 segments, and leave the generated object key within S3's 1024-byte limit.
 
 Uploads use the AWS SDK retry behavior. Files up to 8 MiB use `PutObject`;
 larger files use ordered multipart upload with seekable bounded parts. Part size
 grows automatically when necessary to remain within S3's 10,000-part limit.
-Every failure after multipart creation attempts `AbortMultipartUpload` with a
-fresh 30-second context, including when the original request was canceled.
+The maximum accepted object is 48.8 TiB: 10,000 parts of at most 5 GiB each.
+Larger staged objects are rejected before an S3 upload request.
+Every failure after S3 returns a usable multipart upload ID attempts
+`AbortMultipartUpload` with a fresh 30-second context, including when the
+original request was canceled. A creation response without an upload ID fails
+clearly without sending a meaningless empty-ID abort request.
 Because the gzip is completely staged before upload, an upload retry does not
 rerun `mysqldump`.
 

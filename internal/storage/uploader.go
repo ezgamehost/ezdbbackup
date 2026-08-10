@@ -20,9 +20,10 @@ const (
 	defaultPartSize           int64 = 5 << 20
 	minimumPartSize           int64 = 5 << 20
 	maximumPartSize           int64 = 5 << 30
-	maximumObjectSize         int64 = 5 << 40
 	maximumPartCount                = 10_000
-	defaultAbortTimeout             = 30 * time.Second
+	// AWS permits 10,000 multipart parts of at most 5 GiB each (48.8 TiB).
+	maximumObjectSize   int64 = maximumPartSize * maximumPartCount
+	defaultAbortTimeout       = 30 * time.Second
 )
 
 type fileUploader struct {
@@ -98,8 +99,7 @@ func (u *fileUploader) multipart(ctx context.Context, bucket, key string, source
 		uploadID = aws.ToString(created.UploadId)
 	}
 	if uploadID == "" {
-		primary := u.safeError("create multipart upload", errors.New("S3 returned an empty multipart upload ID"))
-		return UploadResult{}, u.abort(ctx, bucket, key, uploadID, primary)
+		return UploadResult{}, u.safeError("create multipart upload response missing upload id", errors.New("S3 returned an empty multipart upload ID"))
 	}
 	if err := ctx.Err(); err != nil {
 		return UploadResult{}, u.abort(ctx, bucket, key, uploadID, u.safeError("upload part", err))

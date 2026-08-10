@@ -295,6 +295,37 @@ func TestValidateS3BucketGrammarForCustomEndpoint(t *testing.T) {
 	}
 }
 
+// This fails if the account-regional -an suffix is treated as reserved, or if
+// a compatible custom endpoint loses its existing single-segment support.
+func TestValidateS3BucketGrammarPreservesANSuffix(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		bucket   string
+		endpoint string
+	}{
+		{
+			name:   "AWS account-regional general-purpose bucket",
+			bucket: "daily-backups-111122223333-us-east-1-an",
+		},
+		{
+			name:     "custom endpoint compatible bucket",
+			bucket:   "Backup_01-an",
+			endpoint: "https://objects.example.test/base",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validConfig()
+			job := cfg.Jobs["production"]
+			job.S3.Bucket = test.bucket
+			job.S3.Endpoint = test.endpoint
+			cfg.Jobs["production"] = job
+			if findings := Validate(cfg); findings.HasErrors() {
+				t.Fatalf("Validate() findings = %v, want valid bucket %q accepted", findings, test.bucket)
+			}
+		})
+	}
+}
+
 // This fails if endpoint credentials, query material, fragments, malformed
 // hosts, or percent-encoded controls can cross the SDK/terminal boundary.
 func TestValidateS3EndpointStructure(t *testing.T) {

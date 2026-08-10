@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -198,7 +199,7 @@ func TestBackupDumpFailureIsLoggedAndCleaned(t *testing.T) {
 	assertDumpFailureLog(t, logDirectory, password)
 }
 
-func TestBackupRetriesTransientS3Upload(t *testing.T) {
+func TestBackupRetriesTransientMultipartUploadAndPreservesObject(t *testing.T) {
 	endpoint := os.Getenv("EZDBBACKUP_TEST_S3_ENDPOINT")
 	if endpoint == "" {
 		t.Skip("integration test requires EZDBBACKUP_TEST_S3_ENDPOINT (for example http://127.0.0.1:4566)")
@@ -233,24 +234,45 @@ func TestBackupRetriesTransientS3Upload(t *testing.T) {
 	}
 	t.Cleanup(func() { cleanBucket(t, directClient, bucket) })
 
-	proxy, uploadAttempts := newTransientUploadProxy(t, endpoint, bucket)
+	proxy := newTransientMultipartUploadProxy(t, endpoint)
 	configPath := filepath.Join(temporary, "config.yml")
 	writeConfig(t, configPath, integrationConfig{
 		Bucket:         bucket,
 		DumpBinary:     fakeDumpBinary,
-		Endpoint:       proxy.URL,
+		Endpoint:       proxy.server.URL,
 		LogDirectory:   logDirectory,
 		RunAs:          currentUser.Username,
 		StageDirectory: stageDirectory,
 	})
 
 	runCLI(t, ctx, backupBinary, "validate", "--all", "--connectivity", "--config", configPath)
-	if got := uploadAttempts.Load(); got != 0 {
-		t.Fatalf("upload attempts after setup and connectivity = %d, want 0", got)
+	if proxy.creates.Load() != 0 || proxy.partAttempts.Load() != 0 {
+		t.Fatalf("multipart calls after setup and connectivity = create:%d parts:%d, want 0/0", proxy.creates.Load(), proxy.partAttempts.Load())
 	}
-	runCLI(t, ctx, backupBinary, "backup", "production", "--config", configPath)
-	if got := uploadAttempts.Load(); got < 2 {
-		t.Fatalf("upload attempts = %d, want at least 2 after one transient failure", got)
+	const dumpBytes = 12 << 20
+	output, exitCode := runCLIWithEnvironment(
+		t,
+		ctx,
+		backupBinary,
+		map[string]string{
+			"AWS_MAX_ATTEMPTS":       "3",
+			"AWS_RETRY_MODE":         "standard",
+			"FAKE_DUMP_RANDOM_BYTES": strconv.Itoa(dumpBytes),
+		},
+		"backup", "production", "--config", configPath,
+	)
+	if exitCode != 0 {
+		t.Fatalf("multipart backup exit code = %d, want 0\n%s", exitCode, output)
+	}
+	expectedObject, forwardedParts := proxy.forwardedObject(t)
+	if proxy.creates.Load() != 1 || proxy.transientFailures.Load() != 1 || proxy.completes.Load() != 1 || proxy.aborts.Load() != 0 {
+		t.Fatalf(
+			"multipart proxy calls = create:%d transient-failures:%d complete:%d abort:%d, want 1/1/1/0",
+			proxy.creates.Load(), proxy.transientFailures.Load(), proxy.completes.Load(), proxy.aborts.Load(),
+		)
+	}
+	if got, want := proxy.partAttempts.Load(), int32(forwardedParts+1); got != want {
+		t.Fatalf("UploadPart attempts = %d, want %d successful parts plus one retry", got, want)
 	}
 
 	objects, err := directClient.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
@@ -267,7 +289,7 @@ func TestBackupRetriesTransientS3Upload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch integration object: %v", err)
 	}
-	compressed, readErr := io.ReadAll(io.LimitReader(object.Body, 1<<20))
+	compressed, readErr := io.ReadAll(io.LimitReader(object.Body, (20<<20)+1))
 	closeErr := object.Body.Close()
 	if readErr != nil {
 		t.Fatalf("read integration object: %v", readErr)
@@ -275,14 +297,35 @@ func TestBackupRetriesTransientS3Upload(t *testing.T) {
 	if closeErr != nil {
 		t.Fatalf("close integration object: %v", closeErr)
 	}
-	if got := gunzip(t, compressed); got != wantSQL {
-		t.Fatalf("decompressed SQL = %q, want %q", got, wantSQL)
+	if len(compressed) > 20<<20 {
+		t.Fatalf("compressed multipart object exceeds test bound: %d bytes", len(compressed))
+	}
+	if len(compressed) <= 8<<20 {
+		t.Fatalf("compressed object size = %d, want genuine multipart object above 8 MiB", len(compressed))
+	}
+	if !bytes.Equal(compressed, expectedObject) {
+		t.Fatalf("completed object differs from the ordered bytes accepted by UploadPart: got %d bytes want %d", len(compressed), len(expectedObject))
+	}
+	gotChecksum := sha256.Sum256(compressed)
+	wantChecksum := sha256.Sum256(expectedObject)
+	if gotChecksum != wantChecksum {
+		t.Fatalf("completed object SHA-256 = %x, want %x", gotChecksum, wantChecksum)
+	}
+	if got := len(gunzip(t, compressed)); got != dumpBytes {
+		t.Fatalf("decompressed dump size = %d, want %d", got, dumpBytes)
+	}
+	uploads, err := directClient.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: aws.String(bucket)})
+	if err != nil {
+		t.Fatalf("list multipart uploads after completion: %v", err)
+	}
+	if len(uploads.Uploads) != 0 {
+		t.Fatalf("completed multipart uploads remain active: %#v", uploads.Uploads)
 	}
 	assertJSONLogs(t, logDirectory)
 	assertNoStagedBackup(t, stageDirectory)
 }
 
-func TestBackupAbortsFailedMultipartUploadAndCleansStaging(t *testing.T) {
+func TestBackupExhaustsMultipartRetriesThenAbortsAndCleansStaging(t *testing.T) {
 	endpoint := os.Getenv("EZDBBACKUP_TEST_S3_ENDPOINT")
 	if endpoint == "" {
 		t.Skip("integration test requires EZDBBACKUP_TEST_S3_ENDPOINT (for example http://127.0.0.1:4566)")
@@ -329,7 +372,11 @@ func TestBackupAbortsFailedMultipartUploadAndCleansStaging(t *testing.T) {
 		t,
 		ctx,
 		backupBinary,
-		map[string]string{"FAKE_DUMP_RANDOM_BYTES": strconv.Itoa(12 << 20)},
+		map[string]string{
+			"AWS_MAX_ATTEMPTS":       "3",
+			"AWS_RETRY_MODE":         "standard",
+			"FAKE_DUMP_RANDOM_BYTES": strconv.Itoa(12 << 20),
+		},
 		"backup", "production", "--config", configPath,
 	)
 	if exitCode != 1 {
@@ -339,8 +386,8 @@ func TestBackupAbortsFailedMultipartUploadAndCleansStaging(t *testing.T) {
 		t.Fatalf("multipart failure output exposed endpoint body: %s", output)
 	}
 	assertLogsOmit(t, logDirectory, "MULTIPART_ENDPOINT_SECRET")
-	if proxy.creates.Load() != 1 || proxy.failedParts.Load() == 0 || proxy.aborts.Load() != 1 {
-		t.Fatalf("multipart proxy calls = create:%d failed-parts:%d abort:%d, want 1/>0/1", proxy.creates.Load(), proxy.failedParts.Load(), proxy.aborts.Load())
+	if proxy.creates.Load() != 1 || proxy.failedParts.Load() != 3 || proxy.aborts.Load() != 1 {
+		t.Fatalf("multipart proxy calls = create:%d failed-parts:%d abort:%d, want 1/3/1", proxy.creates.Load(), proxy.failedParts.Load(), proxy.aborts.Load())
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -392,8 +439,9 @@ func newMultipartFailureProxy(t *testing.T, endpoint string) *multipartFailurePr
 			_, _ = io.Copy(io.Discard, request.Body)
 			_ = request.Body.Close()
 			writer.Header().Set("Content-Type", "application/xml")
-			writer.WriteHeader(http.StatusBadRequest)
-			_, _ = io.WriteString(writer, `<Error><Code>InvalidRequest</Code><Message>MULTIPART_ENDPOINT_SECRET `+request.URL.String()+`</Message></Error>`)
+			writer.Header().Set("Retry-After", "0")
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(writer, `<Error><Code>ServiceUnavailable</Code><Message>MULTIPART_ENDPOINT_SECRET `+request.URL.String()+`</Message></Error>`)
 			return
 		case request.Method == http.MethodDelete && query.Get("uploadId") != "":
 			proxy.aborts.Add(1)
@@ -404,32 +452,114 @@ func newMultipartFailureProxy(t *testing.T, endpoint string) *multipartFailurePr
 	return proxy
 }
 
-func newTransientUploadProxy(t *testing.T, endpoint, bucket string) (*httptest.Server, *atomic.Int32) {
+type transientMultipartProxy struct {
+	server            *httptest.Server
+	creates           atomic.Int32
+	partAttempts      atomic.Int32
+	transientFailures atomic.Int32
+	completes         atomic.Int32
+	aborts            atomic.Int32
+
+	mu              sync.Mutex
+	firstFailedPart []byte
+	forwardedParts  map[int][]byte
+	handlerErr      error
+}
+
+func newTransientMultipartUploadProxy(t *testing.T, endpoint string) *transientMultipartProxy {
 	t.Helper()
 	target, err := url.Parse(endpoint)
 	if err != nil {
 		t.Fatalf("parse LocalStack endpoint: %v", err)
 	}
+	proxy := &transientMultipartProxy{forwardedParts: make(map[int][]byte)}
 	reverseProxy := httputil.NewSingleHostReverseProxy(target)
-	uploadAttempts := &atomic.Int32{}
-	uploadPathPrefix := "/" + bucket + "/integration/production/"
-	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method == http.MethodPut && strings.HasPrefix(request.URL.Path, uploadPathPrefix) {
-			attempt := uploadAttempts.Add(1)
-			if attempt == 1 {
-				_, _ = io.Copy(io.Discard, request.Body)
-				_ = request.Body.Close()
+	proxy.server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		query := request.URL.Query()
+		switch {
+		case request.Method == http.MethodPost && query.Has("uploads"):
+			proxy.creates.Add(1)
+		case request.Method == http.MethodPut && query.Get("partNumber") != "" && query.Get("uploadId") != "":
+			partNumber, parseErr := strconv.Atoi(query.Get("partNumber"))
+			if parseErr != nil || partNumber < 1 {
+				proxy.recordHandlerError(fmt.Errorf("invalid UploadPart number %q", query.Get("partNumber")))
+				http.Error(writer, "invalid multipart test request", http.StatusBadGateway)
+				return
+			}
+			body, readErr := io.ReadAll(io.LimitReader(request.Body, (6<<20)+1))
+			closeErr := request.Body.Close()
+			if readErr != nil || closeErr != nil || len(body) > 6<<20 {
+				proxy.recordHandlerError(fmt.Errorf("capture UploadPart %d: bytes=%d read=%v close=%v", partNumber, len(body), readErr, closeErr))
+				http.Error(writer, "capture multipart test request", http.StatusBadGateway)
+				return
+			}
+			proxy.partAttempts.Add(1)
+			if proxy.transientFailures.CompareAndSwap(0, 1) {
+				proxy.mu.Lock()
+				proxy.firstFailedPart = bytes.Clone(body)
+				proxy.mu.Unlock()
 				writer.Header().Set("Content-Type", "application/xml")
 				writer.Header().Set("Retry-After", "0")
 				writer.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = io.WriteString(writer, `<Error><Code>ServiceUnavailable</Code><Message>transient upload fault</Message></Error>`)
+				_, _ = io.WriteString(writer, `<Error><Code>ServiceUnavailable</Code><Message>transient multipart upload fault</Message></Error>`)
 				return
 			}
+			proxy.recordForwardedPart(partNumber, body)
+			request.Body = io.NopCloser(bytes.NewReader(body))
+			request.ContentLength = int64(len(body))
+			request.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(body)), nil
+			}
+		case request.Method == http.MethodPost && query.Get("uploadId") != "":
+			proxy.completes.Add(1)
+		case request.Method == http.MethodDelete && query.Get("uploadId") != "":
+			proxy.aborts.Add(1)
 		}
 		reverseProxy.ServeHTTP(writer, request)
 	}))
-	t.Cleanup(proxy.Close)
-	return proxy, uploadAttempts
+	t.Cleanup(proxy.server.Close)
+	return proxy
+}
+
+func (p *transientMultipartProxy) recordHandlerError(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.handlerErr == nil {
+		p.handlerErr = err
+	}
+}
+
+func (p *transientMultipartProxy) recordForwardedPart(partNumber int, body []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if partNumber == 1 && p.firstFailedPart != nil && !bytes.Equal(body, p.firstFailedPart) && p.handlerErr == nil {
+		p.handlerErr = errors.New("retried first UploadPart body differs from the failed attempt")
+	}
+	if _, exists := p.forwardedParts[partNumber]; exists && p.handlerErr == nil {
+		p.handlerErr = fmt.Errorf("UploadPart %d was forwarded more than once", partNumber)
+	}
+	p.forwardedParts[partNumber] = bytes.Clone(body)
+}
+
+func (p *transientMultipartProxy) forwardedObject(t *testing.T) ([]byte, int) {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.handlerErr != nil {
+		t.Fatalf("multipart fault proxy: %v", p.handlerErr)
+	}
+	if len(p.forwardedParts) == 0 {
+		t.Fatal("multipart fault proxy forwarded no parts")
+	}
+	object := make([]byte, 0)
+	for partNumber := 1; partNumber <= len(p.forwardedParts); partNumber++ {
+		part, ok := p.forwardedParts[partNumber]
+		if !ok {
+			t.Fatalf("multipart fault proxy did not forward part %d", partNumber)
+		}
+		object = append(object, part...)
+	}
+	return object, len(p.forwardedParts)
 }
 
 func repositoryRoot(t *testing.T) string {
