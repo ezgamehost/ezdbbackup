@@ -28,16 +28,24 @@ The EZ Game Host APT repository supports Linux `amd64` and `arm64`. Install its
 dedicated archive key only after verifying the full fingerprint:
 
 ```sh
+set -eu
+expected_fingerprint=ABD25D98B108D34E1BDA4CF6FD22EEB49867BCC6
 key_tmp="$(mktemp)"
-curl -fsSL https://packages.ezghcloud.com/keys/ez-game-host-archive-keyring.asc -o "${key_tmp}"
-fingerprint="$(gpg --show-keys --with-colons "${key_tmp}" | awk -F: '$1 == "fpr" {print $10; exit}')"
-if [ "${fingerprint}" != "ABD25D98B108D34E1BDA4CF6FD22EEB49867BCC6" ]; then
+key_home="$(mktemp -d)"
+verified_key="$(mktemp)"
+chmod 0700 "${key_home}"
+curl -fsSL https://packages.ezghcloud.com/keys/ez-game-host-archive-keyring-ABD25D98B108D34E1BDA4CF6FD22EEB49867BCC6.asc -o "${key_tmp}"
+gpg --homedir "${key_home}" --batch --quiet --import "${key_tmp}"
+fingerprints="$(gpg --homedir "${key_home}" --batch --quiet --with-colons --list-keys | awk -F: '$1 == "pub" {primary = 1; next} primary && $1 == "fpr" {print $10; primary = 0}')"
+if [ "${fingerprints}" != "${expected_fingerprint}" ]; then
   echo "EZ Game Host archive-key fingerprint mismatch" >&2
   exit 1
 fi
+gpg --homedir "${key_home}" --batch --quiet --armor --export "${expected_fingerprint}" >"${verified_key}"
 sudo install -d -m 0755 /etc/apt/keyrings
-sudo install -m 0644 "${key_tmp}" /etc/apt/keyrings/ez-game-host-archive-keyring.asc
-rm -f "${key_tmp}"
+sudo install -m 0644 "${verified_key}" /etc/apt/keyrings/ez-game-host-archive-keyring.asc
+gpgconf --homedir "${key_home}" --kill all || true
+rm -rf -- "${key_tmp}" "${key_home}" "${verified_key}"
 ```
 
 Configure the repository with a deb822 source restricted to that key, then
@@ -49,6 +57,7 @@ Types: deb
 URIs: https://packages.ezghcloud.com/apt
 Suites: stable
 Components: main
+Architectures: amd64 arm64
 Signed-By: /etc/apt/keyrings/ez-game-host-archive-keyring.asc
 EOF
 sudo apt-get update

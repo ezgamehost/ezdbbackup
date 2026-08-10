@@ -16,6 +16,7 @@ const (
 	packageCallLogEnv    = "EZDBBACKUP_RELEASE_CALL_LOG"
 	packageFailToolEnv   = "EZDBBACKUP_RELEASE_FAIL_TOOL"
 	packageRealSHAEnv    = "EZDBBACKUP_RELEASE_REAL_SHA256SUM"
+	packageRealDpkgEnv   = "EZDBBACKUP_RELEASE_REAL_DPKG_DEB"
 )
 
 func TestMain(m *testing.M) {
@@ -204,6 +205,12 @@ func TestPackageReleaseFailsClosedWhenVerificationFails(t *testing.T) {
 		{name: "static linkage", fail: "linkage", want: "not a static amd64 Linux ELF executable"},
 		{name: "dynamic dependency", fail: "ldd", want: "dynamic dependency reported"},
 		{name: "version", fail: "version", want: "reports unexpected version"},
+		{name: "debian build", fail: "deb-build", want: "fake dpkg-deb build failure"},
+		{name: "debian metadata", fail: "deb-metadata", want: "package Architecture field"},
+		{name: "debian contents", fail: "deb-contents", want: "package contents do not match required manifest"},
+		{name: "debian ownership and mode", fail: "deb-owner-mode", want: "package contents do not match required manifest"},
+		{name: "debian maintainer script", fail: "deb-control", want: "package control archive contains unexpected files"},
+		{name: "debian embedded binary", fail: "deb-binary", want: "package binary differs from verified build"},
 		{name: "checksum", fail: "checksum", want: "fake checksum verification failure"},
 	}
 	for _, test := range tests {
@@ -246,7 +253,7 @@ func newPackageFixture(t *testing.T, fail string) packageFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tool := range []string{"go", "file", "ldd", "sha256sum"} {
+	for _, tool := range []string{"go", "file", "ldd", "sha256sum", "dpkg-deb"} {
 		if err := os.Symlink(testBinary, filepath.Join(fakeBin, tool)); err != nil {
 			t.Fatal(err)
 		}
@@ -279,6 +286,7 @@ func (fixture packageFixture) run(t *testing.T) (string, error) {
 		packageCallLogEnv:             fixture.callLog,
 		packageFailToolEnv:            fixture.fail,
 		packageRealSHAEnv:             fixture.realSHA,
+		packageRealDpkgEnv:            mustLookPath(t, "dpkg-deb"),
 	})
 	output, err := command.CombinedOutput()
 	return string(output), err
@@ -504,10 +512,81 @@ func runPackageToolHelper() int {
 			return 127
 		}
 		return 0
+	case "dpkg-deb":
+		return runFakeDpkgDeb()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown fake package tool %q\n", tool)
 		return 127
 	}
+}
+
+func runFakeDpkgDeb() int {
+	realTool := os.Getenv(packageRealDpkgEnv)
+	arguments := os.Args[1:]
+	failure := os.Getenv(packageFailToolEnv)
+	if failure == "deb-build" && containsString(arguments, "--build") {
+		fmt.Fprintln(os.Stderr, "fake dpkg-deb build failure")
+		return 1
+	}
+	if failure == "deb-metadata" && len(arguments) >= 3 && arguments[0] == "-f" && arguments[2] == "Architecture" {
+		fmt.Println("all")
+		return 0
+	}
+
+	command := exec.Command(realTool, arguments...)
+	command.Stdin = os.Stdin
+	if (failure == "deb-contents" || failure == "deb-owner-mode") && containsString(arguments, "--contents") {
+		output, err := command.CombinedOutput()
+		if err != nil {
+			fmt.Fprint(os.Stderr, string(output))
+			return exitCode(err)
+		}
+		listing := string(output)
+		if failure == "deb-contents" {
+			listing += "-rw-r--r-- root/root 0 2026-01-01 00:00 ./etc/unsafe\n"
+		} else {
+			listing = strings.Replace(listing, "-rwxr-xr-x root/root", "-rwxrwxrwx 1000/1000", 1)
+		}
+		fmt.Print(listing)
+		return 0
+	}
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	if err := command.Run(); err != nil {
+		return exitCode(err)
+	}
+	if failure == "deb-binary" && containsString(arguments, "--extract") {
+		extractRoot := arguments[len(arguments)-1]
+		if err := os.WriteFile(filepath.Join(extractRoot, "usr", "bin", "ezdbbackup"), []byte("tampered\n"), 0o755); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	if failure == "deb-control" && containsString(arguments, "--control") {
+		controlRoot := arguments[len(arguments)-1]
+		if err := os.WriteFile(filepath.Join(controlRoot, "postinst"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	return 0
+}
+
+func exitCode(err error) int {
+	if exit, ok := err.(*exec.ExitError); ok {
+		return exit.ExitCode()
+	}
+	fmt.Fprintln(os.Stderr, err)
+	return 127
+}
+
+func mustLookPath(t *testing.T, name string) string {
+	t.Helper()
+	path, err := exec.LookPath(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func appendPackageCall(tool string, args []string) error {

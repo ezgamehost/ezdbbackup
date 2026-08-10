@@ -14,8 +14,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: go.mod
       - name: Unit tests
@@ -27,8 +27,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: go.mod
       - name: Vet
@@ -40,8 +40,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: go.mod
       - name: Race tests
@@ -53,8 +53,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: go.mod
 
@@ -62,7 +62,7 @@ jobs:
         run: bash scripts/package-release.sh
 
       - name: Upload verified release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-dist
           path: dist/
@@ -82,8 +82,8 @@ jobs:
       EZDBBACKUP_TEST_S3_ENDPOINT: http://127.0.0.1:4566
       COMPOSE_PROJECT_NAME: ezdbbackup-release-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: go.mod
       - name: Docker versions
@@ -111,7 +111,7 @@ jobs:
       contents: write
     steps:
       - name: Download verified release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: release-dist
           path: dist
@@ -121,7 +121,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/SHA256SUMS \
+            "dist/ezdbbackup_${GITHUB_REF_NAME}_linux_amd64.tar.gz" \
+            "dist/ezdbbackup_${GITHUB_REF_NAME}_linux_arm64.tar.gz" \
+            --verify-tag --generate-notes
 
   apt-publish:
     needs: publish
@@ -129,9 +134,10 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Download verified release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: release-dist
           path: dist
@@ -153,9 +159,8 @@ jobs:
             echo 'EZDBBACKUP_PACKAGES'
           } >>"${GITHUB_OUTPUT}"
       - name: Publish Debian packages to the EZ Game Host APT repository
-        uses: ezgamehost/apt-repo-infra/.github/actions/publish@8c24b79cdad7db0acf6f321d31aae831e4130196
+        uses: ezgamehost/apt-repo-infra/.github/actions/publish@f15cb00f0e62d7ac70464b05804ab8d7267f0fb7 # v1.1.0
         with:
           release-tag: ${{ github.ref_name }}
           package-files: ${{ steps.packages.outputs.files }}
           github-token: ${{ github.token }}
-          infra-token: ${{ secrets.APT_REPOSITORY_DISPATCH_TOKEN }}
