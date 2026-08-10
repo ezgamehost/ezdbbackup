@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"strings"
 
 	"github.com/ezgamehost/ezdbbackup/internal/backup"
 	"github.com/ezgamehost/ezdbbackup/internal/config"
@@ -58,6 +59,9 @@ func runBackup(ctx context.Context, args []string, deps Dependencies) int {
 		selected = []string{name}
 	}
 	if *all && len(selected) == 0 {
+		if printConfigFindings(globalConfigFindings(cfg), deps) {
+			return 2
+		}
 		printBackupSummary(backup.Summary{}, deps)
 		return 0
 	}
@@ -96,6 +100,18 @@ func runBackup(ctx context.Context, args []string, deps Dependencies) int {
 		return 1
 	}
 	return 0
+}
+
+func globalConfigFindings(cfg *config.Config) config.Findings {
+	all := config.Validate(cfg)
+	global := make(config.Findings, 0, len(all))
+	for _, finding := range all {
+		if strings.HasPrefix(finding.Path, "jobs.") {
+			continue
+		}
+		global = append(global, finding)
+	}
+	return global
 }
 
 func executablePath(deps Dependencies) (string, error) {

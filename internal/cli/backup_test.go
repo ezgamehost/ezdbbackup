@@ -306,6 +306,7 @@ func TestBackupAllWithNoEnabledJobsHasNoValidationOrBackupEffects(t *testing.T) 
 	cfg := cliTestConfig("disabled")
 	disabled := cfg.Jobs["disabled"]
 	disabled.Enabled = false
+	disabled.MySQL.Host = ""
 	cfg.Jobs["disabled"] = disabled
 	deps.LoadConfig = func(string) (*config.Config, config.Findings) { return cfg, nil }
 	validatorCalls, loggerCalls, backupCalls := 0, 0, 0
@@ -333,6 +334,63 @@ func TestBackupAllWithNoEnabledJobsHasNoValidationOrBackupEffects(t *testing.T) 
 	}
 }
 
+func TestBackupAllWithNoEnabledJobsRejectsGlobalConfigurationErrorsWithoutEffects(t *testing.T) {
+	maxSizeMB := int(^uint64(0)>>1) / (1024 * 1024)
+	maxAgeDays := int(^uint64(0)>>1) / int(24*time.Hour)
+	for _, tt := range []struct {
+		name     string
+		edit     func(*config.Config)
+		wantPath string
+	}{
+		{name: "version", edit: func(cfg *config.Config) { cfg.Version = 2 }, wantPath: "version"},
+		{name: "default dump path", edit: func(cfg *config.Config) { cfg.Defaults.DumpBinary = "mysqldump" }, wantPath: "defaults.dump_binary"},
+		{name: "default temp path", edit: func(cfg *config.Config) { cfg.Defaults.TempDir = "tmp" }, wantPath: "defaults.temp_dir"},
+		{name: "log path", edit: func(cfg *config.Config) { cfg.Logging.Directory = "logs" }, wantPath: "logging.directory"},
+		{name: "rotation size zero", edit: func(cfg *config.Config) { cfg.Logging.Rotation.MaxSizeMB = 0 }, wantPath: "logging.rotation.max_size_mb"},
+		{name: "rotation files zero", edit: func(cfg *config.Config) { cfg.Logging.Rotation.MaxFiles = 0 }, wantPath: "logging.rotation.max_files"},
+		{name: "rotation age zero", edit: func(cfg *config.Config) { cfg.Logging.Rotation.MaxAgeDays = 0 }, wantPath: "logging.rotation.max_age_days"},
+		{name: "rotation size", edit: func(cfg *config.Config) { cfg.Logging.Rotation.MaxSizeMB = maxSizeMB + 1 }, wantPath: "logging.rotation.max_size_mb"},
+		{name: "rotation age", edit: func(cfg *config.Config) { cfg.Logging.Rotation.MaxAgeDays = maxAgeDays + 1 }, wantPath: "logging.rotation.max_age_days"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			deps := fakeDependencies(&stdout, &stderr)
+			cfg := cliTestConfig("disabled")
+			disabled := cfg.Jobs["disabled"]
+			disabled.Enabled = false
+			cfg.Jobs["disabled"] = disabled
+			tt.edit(cfg)
+			deps.LoadConfig = func(string) (*config.Config, config.Findings) { return cfg, nil }
+			validatorCalls, loggerCalls, backupCalls := 0, 0, 0
+			deps.Validator = checkerFunc(func(context.Context, *config.Config, []string, validation.Options) validation.Report {
+				validatorCalls++
+				return validation.Report{}
+			})
+			deps.NewLogger = func(logging.Options) (logging.Sink, error) {
+				loggerCalls++
+				return discardSink{}, nil
+			}
+			deps.NewBackup = func(logging.Sink) *backup.Service {
+				backupCalls++
+				return (&backupRuntime{}).newService(discardSink{})
+			}
+
+			if code := Run(context.Background(), []string{"backup", "--all"}, deps); code != 2 {
+				t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+			}
+			if validatorCalls != 0 || loggerCalls != 0 || backupCalls != 0 {
+				t.Fatalf("effects = validator:%d logger:%d backup:%d", validatorCalls, loggerCalls, backupCalls)
+			}
+			if !strings.Contains(stderr.String(), tt.wantPath) {
+				t.Fatalf("stderr = %q, want global finding %q", stderr.String(), tt.wantPath)
+			}
+			if strings.Contains(stdout.String(), "backup summary:") {
+				t.Fatalf("stdout = %q, want no success summary", stdout.String())
+			}
+		})
+	}
+}
+
 type recordingValidator struct {
 	jobs    []string
 	options validation.Options
@@ -353,7 +411,8 @@ func (v *recordingValidator) Check(_ context.Context, _ *config.Config, jobs []s
 
 func cliTestConfig(names ...string) *config.Config {
 	cfg := &config.Config{
-		Version: 1,
+		Version:  1,
+		Defaults: config.Defaults{DumpBinary: "/usr/bin/mysqldump", TempDir: "/tmp"},
 		Logging: config.LoggingConfig{
 			Directory: "/var/log/ezdbbackup",
 			Rotation:  config.RotationConfig{MaxSizeMB: 100, MaxFiles: 7, MaxAgeDays: 30, Compress: true},
