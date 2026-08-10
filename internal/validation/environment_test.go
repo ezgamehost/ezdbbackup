@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -41,7 +42,7 @@ func TestOSEnvironmentExecutableRequiresAbsoluteRegularExecutableAndVersion(t *t
 	requireLinux(t)
 	runAs := currentUsername(t)
 	env := OSEnvironment{}
-	dir := t.TempDir()
+	dir := secureValidationDir(t)
 	executable := filepath.Join(dir, "mysqldump")
 	writeExecutable(t, executable, "#!/bin/sh\n[ \"$1\" = --version ]\n")
 
@@ -74,10 +75,20 @@ func TestOSEnvironmentExecutableRequiresAbsoluteRegularExecutableAndVersion(t *t
 	}
 }
 
+func TestOSEnvironmentRuntimeExecutableUsesEzdbbackupVersionCommand(t *testing.T) {
+	requireLinux(t)
+	dir := secureValidationDir(t)
+	path := filepath.Join(dir, "ezdbbackup")
+	writeExecutable(t, path, "#!/bin/sh\n[ \"$1\" = version ]\n")
+	if err := (OSEnvironment{}).CheckRuntimeExecutable(context.Background(), path, currentUsername(t)); err != nil {
+		t.Fatalf("CheckRuntimeExecutable(version subcommand) error = %v", err)
+	}
+}
+
 func TestOSEnvironmentExecutableUsesIntendedUserPermissions(t *testing.T) {
 	requireLinux(t)
 	other := lookupDifferentUser(t)
-	path := filepath.Join(t.TempDir(), "owner-only")
+	path := filepath.Join(secureValidationDir(t), "owner-only")
 	writeExecutable(t, path, "#!/bin/sh\nexit 0\n")
 	if err := os.Chmod(path, 0o700); err != nil {
 		t.Fatal(err)
@@ -89,11 +100,102 @@ func TestOSEnvironmentExecutableUsesIntendedUserPermissions(t *testing.T) {
 	}
 }
 
-func TestOSEnvironmentRejectsSymlinkTargets(t *testing.T) {
+func TestOSEnvironmentExecutableRejectsUnrelatedOwner(t *testing.T) {
+	requireLinux(t)
+	other := lookupDifferentUser(t)
+	dir := secureValidationDir(t)
+	for _, directory := range []string{filepath.Dir(dir), dir} {
+		if err := os.Chmod(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(dir, "public-but-untrusted")
+	writeExecutable(t, path, "#!/bin/sh\nexit 0\n")
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := (OSEnvironment{}).CheckExecutableAs(context.Background(), path, other.Username)
+	if err == nil || !strings.Contains(err.Error(), "owner") {
+		t.Fatalf("CheckExecutableAs(unrelated owner) error = %v, want ownership rejection", err)
+	}
+}
+
+func TestVersionProbeCredentialsNeverRunAnotherUsersCodeAsInvoker(t *testing.T) {
+	identity := userIdentity{
+		uid: 2000,
+		gid: 3000,
+		groups: map[uint32]struct{}{
+			3000: {},
+			4000: {},
+		},
+	}
+	credential, err := versionProbeCredential(identity, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil || credential.Uid != identity.uid || credential.Gid != identity.gid {
+		t.Fatalf("root probe credential = %#v, want uid %d gid %d", credential, identity.uid, identity.gid)
+	}
+	if _, err := versionProbeCredential(identity, 1000); err == nil || !strings.Contains(err.Error(), "safely") {
+		t.Fatalf("unprivileged cross-user credential error = %v, want fail-closed rejection", err)
+	}
+	credential, err = versionProbeCredential(identity, identity.uid)
+	if err != nil || credential != nil {
+		t.Fatalf("same-user probe credential = %#v, %v; want ambient identity", credential, err)
+	}
+}
+
+func TestOSEnvironmentRootRunsVersionProbeAsIntendedUser(t *testing.T) {
+	requireLinux(t)
+	if os.Geteuid() != 0 {
+		t.Skip("credential transition fixture requires root")
+	}
+	other := lookupDifferentUser(t)
+	dir := secureValidationDir(t)
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "owned-by-run-as")
+	writeExecutable(t, path, "#!/bin/sh\n[ \"$(id -u)\" = \"$EXPECTED_UID\" ]\n")
+	uid, err := strconv.Atoi(other.Uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid, err := strconv.Atoi(other.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(path, uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// The fixed probe environment intentionally omits EXPECTED_UID, so this
+	// script would fail if it inherited the privileged validator environment.
+	t.Setenv("EXPECTED_UID", other.Uid)
+	if err := (OSEnvironment{}).CheckExecutableAs(context.Background(), path, other.Username); err == nil {
+		t.Fatal("CheckExecutableAs() inherited the validator environment")
+	}
+	writeExecutable(t, path, "#!/bin/sh\n[ \"$(id -u)\" = \""+other.Uid+"\" ]\n")
+	if err := os.Chown(path, uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (OSEnvironment{}).CheckExecutableAs(context.Background(), path, other.Username); err != nil {
+		t.Fatalf("CheckExecutableAs(run_as-owned as root) error = %v", err)
+	}
+}
+
+func TestOSEnvironmentAllowsSecureSymlinkTargets(t *testing.T) {
 	requireLinux(t)
 	runAs := currentUsername(t)
 	env := OSEnvironment{}
-	dir := t.TempDir()
+	dir := secureValidationDir(t)
 
 	executableTarget := filepath.Join(dir, "real-mysqldump")
 	writeExecutable(t, executableTarget, "#!/bin/sh\nexit 0\n")
@@ -101,8 +203,8 @@ func TestOSEnvironmentRejectsSymlinkTargets(t *testing.T) {
 	if err := os.Symlink(executableTarget, executableLink); err != nil {
 		t.Fatal(err)
 	}
-	if err := env.CheckExecutableAs(context.Background(), executableLink, runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
-		t.Fatalf("CheckExecutableAs(symlink) error = %v, want symbolic-link error", err)
+	if err := env.CheckExecutableAs(context.Background(), executableLink, runAs); err != nil {
+		t.Fatalf("CheckExecutableAs(secure symlink) error = %v", err)
 	}
 
 	secretTarget := filepath.Join(dir, "real-secret")
@@ -113,25 +215,31 @@ func TestOSEnvironmentRejectsSymlinkTargets(t *testing.T) {
 	if err := os.Symlink(secretTarget, secretLink); err != nil {
 		t.Fatal(err)
 	}
-	if err := env.CheckSecretFile(secretLink, runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
-		t.Fatalf("CheckSecretFile(symlink) error = %v, want symbolic-link error", err)
+	if err := env.CheckSecretFile(secretLink, runAs); err != nil {
+		t.Fatalf("CheckSecretFile(secure symlink) error = %v", err)
 	}
 
-	directoryTarget := t.TempDir()
+	directoryTarget := secureValidationDir(t)
+	if err := os.Chmod(directoryTarget, 0o750); err != nil {
+		t.Fatal(err)
+	}
 	directoryLink := filepath.Join(dir, "writable")
 	if err := os.Symlink(directoryTarget, directoryLink); err != nil {
 		t.Fatal(err)
 	}
-	if err := env.CheckWritableTarget(directoryLink, runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
-		t.Fatalf("CheckWritableTarget(symlink) error = %v, want symbolic-link error", err)
+	if err := env.CheckWritableTarget(directoryLink, runAs); err != nil {
+		t.Fatalf("CheckWritableTarget(secure symlink) error = %v", err)
+	}
+	if err := env.CheckLoggingTarget(directoryLink, []string{runAs}); err != nil {
+		t.Fatalf("CheckLoggingTarget(secure symlink) error = %v", err)
 	}
 }
 
-func TestOSEnvironmentRejectsSymlinkedParentComponents(t *testing.T) {
+func TestOSEnvironmentAllowsSecureSymlinkedParentComponents(t *testing.T) {
 	requireLinux(t)
 	runAs := currentUsername(t)
 	env := OSEnvironment{}
-	root := t.TempDir()
+	root := secureValidationDir(t)
 	realParent := filepath.Join(root, "real-parent")
 	if err := os.Mkdir(realParent, 0o700); err != nil {
 		t.Fatal(err)
@@ -143,35 +251,35 @@ func TestOSEnvironmentRejectsSymlinkedParentComponents(t *testing.T) {
 
 	executable := filepath.Join(realParent, "mysqldump")
 	writeExecutable(t, executable, "#!/bin/sh\nexit 0\n")
-	if err := env.CheckExecutableAs(context.Background(), filepath.Join(linkedParent, "mysqldump"), runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
-		t.Fatalf("CheckExecutableAs(symlinked parent) error = %v, want symbolic-link error", err)
+	if err := env.CheckExecutableAs(context.Background(), filepath.Join(linkedParent, "mysqldump"), runAs); err != nil {
+		t.Fatalf("CheckExecutableAs(secure symlinked parent) error = %v", err)
 	}
 
 	secret := filepath.Join(realParent, "secret")
 	if err := os.WriteFile(secret, []byte("secret"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := env.CheckSecretFile(filepath.Join(linkedParent, "secret"), runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
-		t.Fatalf("CheckSecretFile(symlinked parent) error = %v, want symbolic-link error", err)
+	if err := env.CheckSecretFile(filepath.Join(linkedParent, "secret"), runAs); err != nil {
+		t.Fatalf("CheckSecretFile(secure symlinked parent) error = %v", err)
 	}
 
 	existingDirectory := filepath.Join(realParent, "existing")
 	if err := os.Mkdir(existingDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := env.CheckWritableTarget(filepath.Join(linkedParent, "existing"), runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
-		t.Fatalf("CheckWritableTarget(existing under symlinked parent) error = %v, want symbolic-link error", err)
+	if err := env.CheckWritableTarget(filepath.Join(linkedParent, "existing"), runAs); err != nil {
+		t.Fatalf("CheckWritableTarget(existing under secure symlinked parent) error = %v", err)
 	}
 
-	if err := env.CheckWritableTarget(filepath.Join(linkedParent, "missing", "target"), runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
-		t.Fatalf("CheckWritableTarget(missing under symlinked parent) error = %v, want symbolic-link error", err)
+	if err := env.CheckWritableTarget(filepath.Join(linkedParent, "missing", "target"), runAs); err != nil {
+		t.Fatalf("CheckWritableTarget(missing under secure symlinked parent) error = %v", err)
 	}
 }
 
 func TestOSEnvironmentRejectsSymlinkBeforeDotDotComponent(t *testing.T) {
 	requireLinux(t)
 	runAs := currentUsername(t)
-	root := t.TempDir()
+	root := secureValidationDir(t)
 	realParent := filepath.Join(root, "real-parent")
 	child := filepath.Join(realParent, "child")
 	if err := os.MkdirAll(child, 0o700); err != nil {
@@ -194,7 +302,7 @@ func TestOSEnvironmentRejectsSymlinkBeforeDotDotComponent(t *testing.T) {
 func TestOSEnvironmentRequiresIntendedUserToTraverseExecutablePath(t *testing.T) {
 	requireLinux(t)
 	other := lookupDifferentUser(t)
-	locked := t.TempDir()
+	locked := secureValidationDir(t)
 	if err := os.Chmod(locked, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -210,11 +318,39 @@ func TestOSEnvironmentRequiresIntendedUserToTraverseExecutablePath(t *testing.T)
 	}
 }
 
+func TestTraversalRejectsReplaceableParentButAllowsStickyBoundary(t *testing.T) {
+	requireLinux(t)
+	runAs := currentUsername(t)
+	identity, err := lookupIdentity(runAs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := secureValidationDir(t)
+	replaceable := filepath.Join(root, "replaceable")
+	if err := os.Mkdir(replaceable, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(replaceable, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(replaceable, "target")
+
+	if err := identity.checkParentTraversal(target); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("checkParentTraversal(non-sticky shared parent) error = %v, want replaceability rejection", err)
+	}
+	if err := os.Chmod(replaceable, os.ModeSticky|0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := identity.checkParentTraversal(target); err != nil {
+		t.Fatalf("checkParentTraversal(sticky shared parent) error = %v", err)
+	}
+}
+
 func TestOSEnvironmentWritableTargetUsesExistingDirectoryOrNearestParent(t *testing.T) {
 	requireLinux(t)
 	runAs := currentUsername(t)
 	env := OSEnvironment{}
-	writable := t.TempDir()
+	writable := secureValidationDir(t)
 	if err := env.CheckWritableTarget(writable, runAs); err != nil {
 		t.Fatalf("CheckWritableTarget(existing) error = %v", err)
 	}
@@ -228,7 +364,7 @@ func TestOSEnvironmentWritableTargetUsesExistingDirectoryOrNearestParent(t *test
 	}
 
 	other := lookupDifferentUser(t)
-	locked := t.TempDir()
+	locked := secureValidationDir(t)
 	if err := os.Chmod(locked, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +387,7 @@ func TestOSEnvironmentWritableTargetUsesExistingDirectoryOrNearestParent(t *test
 func TestOSEnvironmentStagingTargetRejectsSharedNonStickyDirectory(t *testing.T) {
 	requireLinux(t)
 	runAs := currentUsername(t)
-	directory := t.TempDir()
+	directory := secureValidationDir(t)
 	if err := os.Chmod(directory, 0o777); err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +405,7 @@ func TestOSEnvironmentStagingTargetAllowsStickyAndPrivateDirectories(t *testing.
 	runAs := currentUsername(t)
 	env := OSEnvironment{}
 
-	privateDirectory := t.TempDir()
+	privateDirectory := secureValidationDir(t)
 	if err := os.Chmod(privateDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +413,7 @@ func TestOSEnvironmentStagingTargetAllowsStickyAndPrivateDirectories(t *testing.
 		t.Fatalf("CheckStagingTarget(private) error = %v", err)
 	}
 
-	stickyParent := t.TempDir()
+	stickyParent := secureValidationDir(t)
 	if err := os.Chmod(stickyParent, os.ModeSticky|0o777); err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +431,7 @@ func TestOSEnvironmentStagingTargetAllowsStickyAndPrivateDirectories(t *testing.
 func TestOSEnvironmentStagingTargetRequiresSafeAncestors(t *testing.T) {
 	requireLinux(t)
 	runAs := currentUsername(t)
-	sharedParent := t.TempDir()
+	sharedParent := secureValidationDir(t)
 	if err := os.Chmod(sharedParent, 0o777); err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +458,7 @@ func TestOSEnvironmentStagingTargetRejectsAttackerOwnedDirectory(t *testing.T) {
 		t.Skip("ownership fixture requires root")
 	}
 	other := lookupDifferentUser(t)
-	directory := t.TempDir()
+	directory := secureValidationDir(t)
 	uid, err := strconv.Atoi(other.Uid)
 	if err != nil {
 		t.Fatal(err)
@@ -348,7 +484,7 @@ func TestOSEnvironmentSecretFileRules(t *testing.T) {
 	requireLinux(t)
 	runAs := currentUsername(t)
 	env := OSEnvironment{}
-	path := filepath.Join(t.TempDir(), "secret")
+	path := filepath.Join(secureValidationDir(t), "secret")
 	if err := os.WriteFile(path, []byte("secret"), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +494,7 @@ func TestOSEnvironmentSecretFileRules(t *testing.T) {
 	if err := env.CheckSecretFile("relative", runAs); err == nil || !strings.Contains(err.Error(), "absolute") {
 		t.Fatalf("CheckSecretFile(relative) error = %v, want absolute error", err)
 	}
-	if err := env.CheckSecretFile(t.TempDir(), runAs); err == nil || !strings.Contains(err.Error(), "regular") {
+	if err := env.CheckSecretFile(secureValidationDir(t), runAs); err == nil || !strings.Contains(err.Error(), "regular") {
 		t.Fatalf("CheckSecretFile(directory) error = %v, want regular-file error", err)
 	}
 	if err := os.Chmod(path, 0o644); err != nil {
@@ -376,6 +512,269 @@ func TestOSEnvironmentSecretFileRules(t *testing.T) {
 	}
 }
 
+func TestOSEnvironmentConfigFileRequiresScheduledReadabilityAndSecrecy(t *testing.T) {
+	requireLinux(t)
+	env := OSEnvironment{}
+	runAs := currentUsername(t)
+	dir := secureValidationDir(t)
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("version: 1\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.CheckConfigFile(path, runAs); err != nil {
+		t.Fatalf("CheckConfigFile(valid) error = %v", err)
+	}
+
+	if err := os.Chmod(path, 0o642); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.CheckConfigFile(path, runAs); err == nil || !strings.Contains(err.Error(), "other") {
+		t.Fatalf("CheckConfigFile(other-readable) error = %v", err)
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.CheckConfigFile(path, runAs); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("CheckConfigFile(group-writable) error = %v", err)
+	}
+
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	other := lookupDifferentUser(t)
+	if err := env.CheckConfigFile(path, other.Username); err == nil || !strings.Contains(err.Error(), "readable") {
+		t.Fatalf("CheckConfigFile(root/current 0600 as %q) error = %v, want scheduled readability failure", other.Username, err)
+	}
+}
+
+func TestOSEnvironmentConfigFileAllowsSecureSymlink(t *testing.T) {
+	requireLinux(t)
+	dir := secureValidationDir(t)
+	target := filepath.Join(dir, "config-target.yml")
+	if err := os.WriteFile(target, []byte("version: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "config.yml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := (OSEnvironment{}).CheckConfigFile(link, currentUsername(t)); err != nil {
+		t.Fatalf("CheckConfigFile(secure symlink) error = %v", err)
+	}
+}
+
+func TestOSEnvironmentRejectsSymlinkRepointedDuringInspection(t *testing.T) {
+	requireLinux(t)
+	dir := secureValidationDir(t)
+	first := filepath.Join(dir, "config-first.yml")
+	second := filepath.Join(dir, "config-second.yml")
+	for _, target := range []string{first, second} {
+		if err := os.WriteFile(target, []byte("version: 1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(dir, "config.yml")
+	if err := os.Symlink(first, link); err != nil {
+		t.Fatal(err)
+	}
+	env := OSEnvironment{beforePathRecheck: func(string) {
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(second, link); err != nil {
+			t.Fatal(err)
+		}
+	}}
+
+	err := env.CheckConfigFile(link, currentUsername(t))
+	if err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("CheckConfigFile(repointed symlink) error = %v, want identity rejection", err)
+	}
+}
+
+func TestOSEnvironmentRejectsWritableExecutableAndPathSwap(t *testing.T) {
+	requireLinux(t)
+	dir := secureValidationDir(t)
+	path := filepath.Join(dir, "ezdbbackup")
+	writeExecutable(t, path, "#!/bin/sh\nexit 0\n")
+	if err := os.Chmod(path, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := (OSEnvironment{}).CheckRuntimeExecutable(context.Background(), path, currentUsername(t)); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("CheckRuntimeExecutable(group-writable) error = %v", err)
+	}
+
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := OSEnvironment{beforePathRecheck: func(resolved string) {
+		if err := os.Rename(resolved, resolved+".original"); err != nil {
+			t.Fatal(err)
+		}
+		writeExecutable(t, resolved, "#!/bin/sh\nexit 0\n")
+	}}
+	if err := env.CheckRuntimeExecutable(context.Background(), path, currentUsername(t)); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("CheckRuntimeExecutable(swapped) error = %v, want identity rejection", err)
+	}
+}
+
+func TestLogDirectoryPolicySameUserSharedGroupAndIncompatibleUsers(t *testing.T) {
+	tests := []struct {
+		name       string
+		stat       syscall.Stat_t
+		identities []userIdentity
+		wantErr    bool
+	}{
+		{
+			name:       "same user private",
+			stat:       syscall.Stat_t{Uid: 1000, Gid: 1000, Mode: syscall.S_IFDIR | 0o750},
+			identities: []userIdentity{{uid: 1000, groups: map[uint32]struct{}{1000: {}}}},
+		},
+		{
+			name: "shared setgid group",
+			stat: syscall.Stat_t{Uid: 0, Gid: 2000, Mode: syscall.S_IFDIR | syscall.S_ISGID | 0o770},
+			identities: []userIdentity{
+				{uid: 1000, groups: map[uint32]struct{}{2000: {}}},
+				{uid: 1001, groups: map[uint32]struct{}{2000: {}}},
+			},
+		},
+		{
+			name: "root and nonroot shared setgid group",
+			stat: syscall.Stat_t{Uid: 0, Gid: 2000, Mode: syscall.S_IFDIR | syscall.S_ISGID | 0o770},
+			identities: []userIdentity{
+				{uid: 0, groups: map[uint32]struct{}{0: {}}},
+				{uid: 1000, groups: map[uint32]struct{}{2000: {}}},
+			},
+		},
+		{
+			name: "incompatible groups",
+			stat: syscall.Stat_t{Uid: 0, Gid: 2000, Mode: syscall.S_IFDIR | syscall.S_ISGID | 0o770},
+			identities: []userIdentity{
+				{uid: 1000, groups: map[uint32]struct{}{2000: {}}},
+				{uid: 1001, groups: map[uint32]struct{}{3000: {}}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "shared without setgid",
+			stat: syscall.Stat_t{Uid: 0, Gid: 2000, Mode: syscall.S_IFDIR | 0o770},
+			identities: []userIdentity{
+				{uid: 1000, groups: map[uint32]struct{}{2000: {}}},
+				{uid: 1001, groups: map[uint32]struct{}{2000: {}}},
+			},
+			wantErr: true,
+		},
+		{
+			name:       "same user malformed shared permissions",
+			stat:       syscall.Stat_t{Uid: 1000, Gid: 2000, Mode: syscall.S_IFDIR | syscall.S_ISGID | 0o720},
+			identities: []userIdentity{{uid: 1000, groups: map[uint32]struct{}{2000: {}}}},
+			wantErr:    true,
+		},
+		{
+			name:       "same user shared with unrelated group",
+			stat:       syscall.Stat_t{Uid: 1000, Gid: 2000, Mode: syscall.S_IFDIR | syscall.S_ISGID | 0o770},
+			identities: []userIdentity{{uid: 1000, groups: map[uint32]struct{}{3000: {}}}},
+			wantErr:    true,
+		},
+		{
+			name: "same UID aliases preserve distinct group sets",
+			stat: syscall.Stat_t{Uid: 1000, Gid: 2000, Mode: syscall.S_IFDIR | syscall.S_ISGID | 0o770},
+			identities: []userIdentity{
+				{uid: 1000, groups: map[uint32]struct{}{2000: {}}},
+				{uid: 1000, groups: map[uint32]struct{}{3000: {}}},
+			},
+			wantErr: true,
+		},
+		{
+			name:       "same user private read group is unrelated",
+			stat:       syscall.Stat_t{Uid: 1000, Gid: 2000, Mode: syscall.S_IFDIR | syscall.S_ISGID | 0o750},
+			identities: []userIdentity{{uid: 1000, groups: map[uint32]struct{}{3000: {}}}},
+			wantErr:    true,
+		},
+		{
+			name: "multiple users require root owned trust boundary",
+			stat: syscall.Stat_t{Uid: 1000, Gid: 2000, Mode: syscall.S_IFDIR | syscall.S_ISGID | 0o770},
+			identities: []userIdentity{
+				{uid: 1000, groups: map[uint32]struct{}{2000: {}}},
+				{uid: 1001, groups: map[uint32]struct{}{2000: {}}},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateLogTargetDirectory(tt.stat, tt.identities)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateLogTargetDirectory() error = %v, wantErr %t", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLogDirectoryTraversalChecksLexicalAndResolvedPaths(t *testing.T) {
+	requireLinux(t)
+	root := secureValidationDir(t)
+	realParent := filepath.Join(root, "real-parent")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logDirectory := filepath.Join(realParent, "logs")
+	if err := os.Mkdir(logDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkedParent := filepath.Join(root, "linked-parent")
+	if err := os.Symlink(realParent, linkedParent); err != nil {
+		t.Fatal(err)
+	}
+
+	identity := userIdentity{uid: uint32(os.Geteuid()) + 1, groups: map[uint32]struct{}{}}
+	err := validateLogTargetTraversal(filepath.Join(linkedParent, "logs"), logDirectory, []userIdentity{identity})
+	if err == nil || !strings.Contains(err.Error(), "lexical path traversal") {
+		t.Fatalf("validateLogTargetTraversal(unsearchable lexical parent) error = %v, want traversal error", err)
+	}
+}
+
+func TestMissingLogDirectoryRequiresNonreplaceableExistingParent(t *testing.T) {
+	requireLinux(t)
+	parent := secureValidationDir(t)
+	if err := os.Chmod(parent, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(parent, "logs")
+	env := OSEnvironment{}
+	if err := env.CheckLoggingTarget(target, []string{currentUsername(t)}); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("CheckLoggingTarget(non-sticky parent) error = %v, want replaceability rejection", err)
+	}
+	if err := os.Chmod(parent, os.ModeSticky|0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.CheckLoggingTarget(target, []string{currentUsername(t)}); err != nil {
+		t.Fatalf("CheckLoggingTarget(sticky parent) error = %v", err)
+	}
+}
+
+func TestExistingLogDirectoryRequiresNonreplaceableLexicalAndResolvedParents(t *testing.T) {
+	requireLinux(t)
+	parent := secureValidationDir(t)
+	target := filepath.Join(parent, "logs")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	env := OSEnvironment{}
+	if err := env.CheckLoggingTarget(target, []string{currentUsername(t)}); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("CheckLoggingTarget(existing beneath non-sticky parent) error = %v, want replaceability rejection", err)
+	}
+	if err := os.Chmod(parent, os.ModeSticky|0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.CheckLoggingTarget(target, []string{currentUsername(t)}); err != nil {
+		t.Fatalf("CheckLoggingTarget(existing beneath sticky parent) error = %v", err)
+	}
+}
+
 func TestOSEnvironmentUserAndCronPathRules(t *testing.T) {
 	env := OSEnvironment{}
 	if err := env.CheckUser(currentUsername(t)); err != nil {
@@ -383,6 +782,13 @@ func TestOSEnvironmentUserAndCronPathRules(t *testing.T) {
 	}
 	if err := env.CheckUser("ezdbbackup-user-that-does-not-exist"); err == nil {
 		t.Fatal("CheckUser(missing) error = nil")
+	}
+	if err := env.CheckRunIdentity(currentUsername(t)); err != nil {
+		t.Fatalf("CheckRunIdentity(current) error = %v", err)
+	}
+	other := lookupDifferentUser(t)
+	if err := env.CheckRunIdentity(other.Username); err == nil || !strings.Contains(err.Error(), "effective user") {
+		t.Fatalf("CheckRunIdentity(%q) error = %v, want mismatch", other.Username, err)
 	}
 
 	for _, valid := range []string{"/usr/local/bin/ezdbbackup", "/etc/ezdbbackup/config.yml"} {
@@ -402,6 +808,15 @@ func requireLinux(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("ezdbbackup v1 supports Linux only")
 	}
+}
+
+func secureValidationDir(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return directory
 }
 
 func currentUsername(t *testing.T) string {

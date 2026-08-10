@@ -15,9 +15,10 @@ import (
 
 // Options controls checks that are specific to the current CLI invocation.
 type Options struct {
-	Connectivity bool
-	BinaryPath   string
-	ConfigPath   string
+	Connectivity    bool
+	BackupExecution bool
+	BinaryPath      string
+	ConfigPath      string
 }
 
 // Checker performs side-effect-free validation.
@@ -43,9 +44,9 @@ func (OSCurrentUser) CurrentUsername() (string, error) {
 }
 
 // Validator coordinates pure configuration checks, local environment checks,
-// and optional read-only connectivity probes. In v1, executable version checks
-// and connectivity probes run as the invoking process; Validator does not
-// impersonate a job's configured run_as user.
+// and optional read-only connectivity probes. Executable version checks use
+// the configured run_as identity when validation is invoked by root.
+// Connectivity probes remain in the invoking process identity.
 type Validator struct {
 	Environment Environment
 	Resolve     jobresolve.OptionsResolver
@@ -89,6 +90,15 @@ func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []str
 	}
 	report = appendCheck(report, "", "cron_binary_path", "binary path is unsafe for cron", v.Environment.CheckCronPath(options.BinaryPath))
 	report = appendCheck(report, "", "cron_config_path", "configuration path is unsafe for cron", v.Environment.CheckCronPath(options.ConfigPath))
+	logRunAs := make([]string, 0, len(cfg.Jobs))
+	seenLogRunAs := make(map[string]bool)
+	for _, enabledName := range cfg.EnabledJobNames() {
+		runAs := cfg.Jobs[enabledName].RunAs
+		if !seenLogRunAs[runAs] {
+			seenLogRunAs[runAs] = true
+			logRunAs = append(logRunAs, runAs)
+		}
+	}
 
 	for _, name := range names {
 		job := cfg.Jobs[name]
@@ -99,12 +109,30 @@ func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []str
 			state.mysqlLocal = false
 			state.s3Local = false
 		}
+		if options.BackupExecution {
+			if err := v.Environment.CheckRunIdentity(job.RunAs); err != nil {
+				report = appendCheck(report, name, "execution_identity", "backup process identity does not match configured run_as", err)
+				state.mysqlLocal = false
+				state.s3Local = false
+			}
+		}
+		if job.Enabled {
+			if err := v.Environment.CheckRuntimeExecutable(ctx, options.BinaryPath, job.RunAs); err != nil {
+				report = appendCheck(report, name, "runtime_executable", "scheduled ezdbbackup executable is unavailable or unsafe", err)
+				state.mysqlLocal = false
+				state.s3Local = false
+			}
+			if err := v.Environment.CheckConfigFile(options.ConfigPath, job.RunAs); err != nil {
+				report = appendCheck(report, name, "configuration_file", "configuration file is unreadable or unsafe for scheduled execution", err)
+				state.mysqlLocal = false
+				state.s3Local = false
+			}
+		}
 		if err := checkExecutable(ctx, v.Environment, job.DumpBinary, job.RunAs); err != nil {
 			report = appendCheck(report, name, "dump_executable", "dump executable is unavailable", err)
 			state.mysqlLocal = false
 		}
 		report = appendCheck(report, name, "temp_directory", "temporary directory is not writable or safe for staging", checkStagingTarget(v.Environment, job.TempDir, job.RunAs))
-		report = appendCheck(report, name, "log_directory", "log directory is not writable", v.Environment.CheckWritableTarget(cfg.Logging.Directory, job.RunAs))
 
 		if job.MySQL.PasswordFile != "" {
 			if err := v.Environment.CheckSecretFile(job.MySQL.PasswordFile, job.RunAs); err != nil {
@@ -122,6 +150,9 @@ func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []str
 			}
 		}
 
+	}
+	if len(logRunAs) > 0 {
+		report = appendCheck(report, "", "log_directory", "global log directory is incompatible with enabled run_as identities", v.Environment.CheckLoggingTarget(cfg.Logging.Directory, logRunAs))
 	}
 	if options.Connectivity {
 		currentUser := v.CurrentUser

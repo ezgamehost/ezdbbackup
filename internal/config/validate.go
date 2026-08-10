@@ -29,6 +29,7 @@ var (
 const (
 	maxRotationSizeMB  = math.MaxInt64 / (1024 * 1024)
 	maxRotationAgeDays = math.MaxInt64 / int64(24*time.Hour)
+	maxRotationFiles   = 1000
 )
 
 // Validate performs configuration-only checks without accessing the network,
@@ -52,6 +53,8 @@ func Validate(cfg *Config) Findings {
 	}
 	if cfg.Logging.Rotation.MaxFiles <= 0 {
 		findings.addError("logging.rotation.max_files", "must be greater than zero")
+	} else if cfg.Logging.Rotation.MaxFiles > maxRotationFiles {
+		findings.addError("logging.rotation.max_files", fmt.Sprintf("must not exceed %d", maxRotationFiles))
 	}
 	if cfg.Logging.Rotation.MaxAgeDays <= 0 {
 		findings.addError("logging.rotation.max_age_days", "must be greater than zero")

@@ -518,7 +518,7 @@ func TestRunReturnsCleanupFailureAfterOtherwiseSuccessfulBackup(t *testing.T) {
 	}
 }
 
-func TestRunCleanupFailureDoesNotMaskUploadFailure(t *testing.T) {
+func TestRunCleanupFailureJoinsBehindUploadFailure(t *testing.T) {
 	uploadErr := errors.New("upload unavailable")
 	cleanupErr := errors.New("cleanup denied")
 	store := &uploadStore{uploadErr: uploadErr}
@@ -532,8 +532,11 @@ func TestRunCleanupFailureDoesNotMaskUploadFailure(t *testing.T) {
 	if !errors.Is(err, uploadErr) {
 		t.Fatalf("Run() error = %v, want upload error", err)
 	}
-	if errors.Is(err, cleanupErr) {
-		t.Fatalf("Run() error = %v, must not include later cleanup error", err)
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("Run() error = %v, want later cleanup error joined", err)
+	}
+	if got := errorStage(err); got != "s3_upload" {
+		t.Fatalf("Run() stage = %q, want primary upload stage", got)
 	}
 	foundCleanupLog := false
 	foundFailureLog := false

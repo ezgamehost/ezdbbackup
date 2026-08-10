@@ -30,10 +30,12 @@ func TestValidatorChecksEveryJobIncludingDisabledInLexicalOrder(t *testing.T) {
 	}
 	want := []string{
 		"cron:/usr/local/bin/ezdbbackup", "cron:/etc/ezdbbackup/config.yml",
-		"user:alpha-user", "executable:/dump/alpha:alpha-user", "staging:/tmp/alpha:alpha-user", "writable:/logs:alpha-user",
+		"user:alpha-user", "runtime-executable:/usr/local/bin/ezdbbackup:alpha-user", "config:/etc/ezdbbackup/config.yml:alpha-user",
+		"executable:/dump/alpha:alpha-user", "staging:/tmp/alpha:alpha-user",
 		"secret:/secrets/alpha-mysql:alpha-user", "secret:/secrets/alpha-access:alpha-user", "secret:/secrets/alpha-secret:alpha-user", "secret:/secrets/alpha-session:alpha-user",
-		"user:zulu-user", "executable:/dump/zulu:zulu-user", "staging:/tmp/zulu:zulu-user", "writable:/logs:zulu-user",
+		"user:zulu-user", "executable:/dump/zulu:zulu-user", "staging:/tmp/zulu:zulu-user",
 		"secret:/secrets/zulu-mysql:zulu-user", "secret:/secrets/zulu-access:zulu-user", "secret:/secrets/zulu-secret:zulu-user", "secret:/secrets/zulu-session:zulu-user",
+		"logging:/logs:alpha-user",
 	}
 	if !reflect.DeepEqual(env.calls, want) {
 		t.Fatalf("environment calls = %#v, want %#v", env.calls, want)
@@ -41,6 +43,94 @@ func TestValidatorChecksEveryJobIncludingDisabledInLexicalOrder(t *testing.T) {
 	if len(remote.calls) != 0 {
 		t.Fatalf("remote calls = %v, want none without connectivity", remote.calls)
 	}
+}
+
+func TestValidatorProvesScheduledConfigBinaryAndGlobalLogAccess(t *testing.T) {
+	cfg := validValidationConfig()
+	cfg.Logging.Directory = "/shared/logs"
+	cfg.Jobs["alpha"] = validValidationJob("alpha", true)
+	cfg.Jobs["bravo"] = validValidationJob("bravo", true)
+	disabled := validValidationJob("disabled", false)
+	cfg.Jobs["disabled"] = disabled
+	env := &fakeEnvironment{}
+
+	report := newValidator(env, &fakeRemoteDependencies{}).Check(context.Background(), cfg, nil, Options{
+		BinaryPath: "/usr/local/bin/ezdbbackup",
+		ConfigPath: "/etc/ezdbbackup/config.yml",
+	})
+	if report.HasErrors() {
+		t.Fatalf("Check() report = %#v", report.Findings)
+	}
+	wantCalls := []string{
+		"runtime-executable:/usr/local/bin/ezdbbackup:alpha-user",
+		"config:/etc/ezdbbackup/config.yml:alpha-user",
+		"runtime-executable:/usr/local/bin/ezdbbackup:bravo-user",
+		"config:/etc/ezdbbackup/config.yml:bravo-user",
+		"logging:/shared/logs:alpha-user,bravo-user",
+	}
+	for _, want := range wantCalls {
+		if !slicesContains(env.calls, want) {
+			t.Fatalf("environment calls = %#v, missing %q", env.calls, want)
+		}
+	}
+	for _, call := range env.calls {
+		if strings.Contains(call, "runtime-executable:") && strings.HasSuffix(call, ":disabled-user") {
+			t.Fatalf("disabled job received scheduled runtime check: %q", call)
+		}
+	}
+}
+
+func TestValidatorReportsScheduledPathAndSharedLogFailuresPrecisely(t *testing.T) {
+	cfg := validValidationConfig()
+	cfg.Jobs["alpha"] = validValidationJob("alpha", true)
+	env := &fakeEnvironment{errors: map[string]error{
+		"runtime-executable:/bin/ezdbbackup:alpha-user": errors.New("binary not executable"),
+		"config:/etc/config.yml:alpha-user":             errors.New("config mode 0600 root-only"),
+		"logging:/logs:alpha-user":                      errors.New("log directory is incompatible"),
+	}}
+
+	report := newValidator(env, &fakeRemoteDependencies{}).Check(context.Background(), cfg, nil, Options{
+		BinaryPath: "/bin/ezdbbackup",
+		ConfigPath: "/etc/config.yml",
+	})
+	for _, want := range []struct{ job, check string }{
+		{job: "alpha", check: "runtime_executable"},
+		{job: "alpha", check: "configuration_file"},
+		{check: "log_directory"},
+	} {
+		if !hasFinding(report, want.job, want.check, "") {
+			t.Fatalf("findings = %#v, want %s failure", report.Findings, want.check)
+		}
+	}
+}
+
+func TestValidatorBackupExecutionRequiresExactRunAsIdentity(t *testing.T) {
+	cfg := validValidationConfig()
+	cfg.Jobs["alpha"] = validValidationJob("alpha", true)
+	env := &fakeEnvironment{errors: map[string]error{
+		"run-identity:alpha-user": errors.New("effective user differs"),
+	}}
+
+	report := newValidator(env, &fakeRemoteDependencies{}).Check(context.Background(), cfg, []string{"alpha"}, Options{
+		BinaryPath:      "/bin/ezdbbackup",
+		ConfigPath:      "/etc/config.yml",
+		BackupExecution: true,
+	})
+	if !hasFinding(report, "alpha", "execution_identity", "configured run_as") {
+		t.Fatalf("findings = %#v, want fail-closed execution-identity finding", report.Findings)
+	}
+	if !slicesContains(env.calls, "run-identity:alpha-user") {
+		t.Fatalf("environment calls = %#v, want run identity check", env.calls)
+	}
+}
+
+func slicesContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestValidatorSelectedJobsLimitConfigurationAndEnvironmentChecks(t *testing.T) {
@@ -60,9 +150,12 @@ func TestValidatorSelectedJobsLimitConfigurationAndEnvironmentChecks(t *testing.
 		t.Fatalf("Check(selected) findings = %#v, want invalid unselected job ignored", report.Findings)
 	}
 	for _, call := range env.calls {
-		if strings.Contains(call, "alpha") {
+		if strings.Contains(call, "alpha") && !strings.HasPrefix(call, "logging:") {
 			t.Fatalf("unselected alpha environment call = %q", call)
 		}
+	}
+	if !slicesContains(env.calls, "logging:/logs:alpha-user,bravo-user") {
+		t.Fatalf("environment calls = %#v, want global log invariant across every enabled job", env.calls)
 	}
 }
 
@@ -473,6 +566,10 @@ func (f *fakeEnvironment) CheckUser(name string) error {
 	return f.call("user:" + name)
 }
 
+func (f *fakeEnvironment) CheckRunIdentity(name string) error {
+	return f.call("run-identity:" + name)
+}
+
 func (f *fakeEnvironment) CheckExecutable(context.Context, string) error {
 	return errors.New("run-as-aware executable check must be used")
 }
@@ -481,8 +578,20 @@ func (f *fakeEnvironment) CheckExecutableAs(_ context.Context, path, runAs strin
 	return f.call("executable:" + path + ":" + runAs)
 }
 
+func (f *fakeEnvironment) CheckRuntimeExecutable(_ context.Context, path, runAs string) error {
+	return f.call("runtime-executable:" + path + ":" + runAs)
+}
+
+func (f *fakeEnvironment) CheckConfigFile(path, runAs string) error {
+	return f.call("config:" + path + ":" + runAs)
+}
+
 func (f *fakeEnvironment) CheckWritableTarget(path, runAs string) error {
 	return f.call("writable:" + path + ":" + runAs)
+}
+
+func (f *fakeEnvironment) CheckLoggingTarget(path string, runAs []string) error {
+	return f.call("logging:" + path + ":" + strings.Join(runAs, ","))
 }
 
 func (f *fakeEnvironment) CheckStagingTarget(path, runAs string) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 
 	"github.com/ezgamehost/ezdbbackup/internal/backup"
 	"github.com/ezgamehost/ezdbbackup/internal/config"
@@ -12,7 +13,7 @@ import (
 
 func runBackup(ctx context.Context, args []string, deps Dependencies) int {
 	flags := flag.NewFlagSet("backup", flag.ContinueOnError)
-	flags.SetOutput(deps.Stderr)
+	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", defaultConfigPath, "configuration file")
 	debug := flags.Bool("debug", false, "enable debug logging")
 	all := flags.Bool("all", false, "back up every enabled job")
@@ -21,6 +22,7 @@ func runBackup(ctx context.Context, args []string, deps Dependencies) int {
 		fmt.Fprintln(deps.Stderr, "       ezdbbackup backup --all [--config <path>] [--debug]")
 	}
 	if err := parseInterspersed(flags, args, map[string]bool{"config": true}); err != nil {
+		fmt.Fprintln(deps.Stderr, encoded(err))
 		flags.Usage()
 		return 2
 	}
@@ -33,7 +35,7 @@ func runBackup(ctx context.Context, args []string, deps Dependencies) int {
 
 	effectiveConfig, err := effectiveAbsolutePath(*configPath)
 	if err != nil {
-		fmt.Fprintf(deps.Stderr, "configuration path: %v\n", err)
+		fmt.Fprintf(deps.Stderr, "configuration path: %s\n", encoded(err))
 		return 2
 	}
 	cfg, findings := deps.LoadConfig(effectiveConfig)
@@ -48,11 +50,11 @@ func runBackup(ctx context.Context, args []string, deps Dependencies) int {
 		name := positional[0]
 		job, exists := cfg.Jobs[name]
 		if !exists {
-			fmt.Fprintf(deps.Stderr, "backup: job %q is not configured\n", name)
+			fmt.Fprintf(deps.Stderr, "backup: job %s is not configured\n", encoded(name))
 			return 2
 		}
 		if !job.Enabled {
-			fmt.Fprintf(deps.Stderr, "backup: job %q is disabled\n", name)
+			fmt.Fprintf(deps.Stderr, "backup: job %s is disabled\n", encoded(name))
 			return 2
 		}
 		selected = []string{name}
@@ -67,12 +69,13 @@ func runBackup(ctx context.Context, args []string, deps Dependencies) int {
 
 	binaryPath, err := executablePath(deps)
 	if err != nil {
-		fmt.Fprintf(deps.Stderr, "backup validation: %v\n", err)
+		fmt.Fprintf(deps.Stderr, "backup validation: %s\n", encoded(err))
 		return 2
 	}
 	report := deps.Validator.Check(ctx, cfg, selected, validation.Options{
-		BinaryPath: binaryPath,
-		ConfigPath: effectiveConfig,
+		BackupExecution: true,
+		BinaryPath:      binaryPath,
+		ConfigPath:      effectiveConfig,
 	})
 	if printValidationReport(report, deps) {
 		return 2
@@ -80,15 +83,19 @@ func runBackup(ctx context.Context, args []string, deps Dependencies) int {
 
 	options, err := logOptions(cfg.Logging, *debug)
 	if err != nil {
-		fmt.Fprintf(deps.Stderr, "backup: invalid logging configuration: %v\n", err)
+		fmt.Fprintf(deps.Stderr, "backup: invalid logging configuration: %s\n", encoded(err))
 		return 2
 	}
 	logger, err := deps.NewLogger(options)
 	if err != nil {
-		fmt.Fprintf(deps.Stderr, "backup: initialize logging: %v\n", err)
+		fmt.Fprintf(deps.Stderr, "backup: initialize logging: %s\n", encoded(err))
 		return 1
 	}
 	service := deps.NewBackup(logger)
+	service.Debug = options.Debug
+	service.Progress = func(event backup.ProgressEvent) {
+		printProgress(deps.Stdout, event)
+	}
 	var names []string
 	if !*all {
 		names = selected
@@ -127,7 +134,7 @@ func printConfigFindings(findings config.Findings, deps Dependencies) bool {
 		if finding.Warning {
 			writer = deps.Stdout
 		}
-		fmt.Fprintln(writer, finding.String())
+		fmt.Fprintln(writer, encoded(finding.String()))
 	}
 	return findings.HasErrors()
 }
@@ -138,7 +145,7 @@ func printValidationReport(report validation.Report, deps Dependencies) bool {
 		if finding.Severity == validation.SeverityWarning {
 			writer = deps.Stdout
 		}
-		fmt.Fprintln(writer, finding.Error())
+		fmt.Fprintln(writer, encoded(finding.Error()))
 	}
 	return report.HasErrors()
 }
@@ -148,11 +155,9 @@ func printBackupSummary(summary backup.Summary, deps Dependencies) {
 	for _, job := range summary.Results {
 		if job.Err != nil {
 			failed++
-			fmt.Fprintf(deps.Stdout, "%s: failed: %v\n", job.Job, job.Err)
 			continue
 		}
 		succeeded++
-		fmt.Fprintf(deps.Stdout, "%s: success: %s (%d bytes)\n", job.Job, job.ObjectKey, job.Size)
 	}
 	fmt.Fprintf(deps.Stdout, "backup summary: %d succeeded, %d failed\n", succeeded, failed)
 }

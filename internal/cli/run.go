@@ -50,7 +50,7 @@ func Run(ctx context.Context, args []string, deps Dependencies) int {
 			fmt.Fprintln(deps.Stderr, "version does not accept arguments")
 			return 2
 		}
-		fmt.Fprintf(deps.Stdout, "ezdbbackup %s\n", deps.Version)
+		fmt.Fprintf(deps.Stdout, "ezdbbackup %s\n", encoded(deps.Version))
 		return 0
 	case "backup":
 		return runBackup(ctx, args[1:], deps)
@@ -59,7 +59,7 @@ func Run(ctx context.Context, args []string, deps Dependencies) int {
 	case "cron":
 		return runCron(ctx, args[1:], deps)
 	default:
-		fmt.Fprintf(deps.Stderr, "unknown command %q\n", args[0])
+		fmt.Fprintf(deps.Stderr, "unknown command %s\n", encoded(args[0]))
 		printUsage(deps.Stderr)
 		return 2
 	}

@@ -12,11 +12,16 @@ logging:
   debug: false
   rotation:
     max_size_mb: 100
+    # Keep between 1 and 1000. Rotation enumerates only existing generations.
     max_files: 7
     max_age_days: 30
     compress: true
 
 jobs:
+  # Both example jobs use one OS identity, so /var/log/ezdbbackup may be a
+  # private 0750 directory owned by ezdbbackup. Distinct run_as users require
+  # a pre-created root-owned 2770 setgid directory and a common group; log
+  # objects then use 0660 rather than 0640.
   production:
     enabled: true
     schedule: "0 2 * * *"

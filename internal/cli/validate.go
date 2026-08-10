@@ -4,13 +4,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 
 	"github.com/ezgamehost/ezdbbackup/internal/validation"
 )
 
 func runValidate(ctx context.Context, args []string, deps Dependencies) int {
 	flags := flag.NewFlagSet("validate", flag.ContinueOnError)
-	flags.SetOutput(deps.Stderr)
+	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", defaultConfigPath, "configuration file")
 	connectivity := flags.Bool("connectivity", false, "check MySQL and S3 connectivity")
 	all := flags.Bool("all", false, "validate every configured job")
@@ -19,6 +20,7 @@ func runValidate(ctx context.Context, args []string, deps Dependencies) int {
 		fmt.Fprintln(deps.Stderr, "usage: ezdbbackup validate [<job> | --all] [--connectivity] [--config <path>] [--debug]")
 	}
 	if err := parseInterspersed(flags, args, map[string]bool{"config": true}); err != nil {
+		fmt.Fprintln(deps.Stderr, encoded(err))
 		flags.Usage()
 		return 2
 	}
@@ -31,7 +33,7 @@ func runValidate(ctx context.Context, args []string, deps Dependencies) int {
 
 	effectiveConfig, err := effectiveAbsolutePath(*configPath)
 	if err != nil {
-		fmt.Fprintf(deps.Stderr, "configuration path: %v\n", err)
+		fmt.Fprintf(deps.Stderr, "configuration path: %s\n", encoded(err))
 		return 2
 	}
 	cfg, findings := deps.LoadConfig(effectiveConfig)
@@ -40,7 +42,7 @@ func runValidate(ctx context.Context, args []string, deps Dependencies) int {
 	}
 	binaryPath, err := executablePath(deps)
 	if err != nil {
-		fmt.Fprintf(deps.Stderr, "validation: %v\n", err)
+		fmt.Fprintf(deps.Stderr, "validation: %s\n", encoded(err))
 		return 2
 	}
 	var selected []string

@@ -112,7 +112,22 @@ func (m Manager) Show() ([]byte, error) {
 // Remove deletes the managed cron file. It succeeds if the file is absent.
 func (m Manager) Remove() (returnErr error) {
 	path := m.path()
-	lock, err := m.acquireMutationLock()
+	present, err := destinationPresent(path)
+	if err != nil {
+		return fmt.Errorf("remove cron %q: inspect destination presence: %w", path, err)
+	}
+
+	var lock *os.File
+	if present {
+		lock, err = m.acquireMutationLock()
+	} else {
+		// Preserve the mutation-free absent fast path, while observing a stable
+		// lock already created by a first install that has not published yet.
+		lock, err = m.acquireExistingMutationLock()
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("remove cron %q: acquire lock: %w", path, err)
 	}
@@ -145,6 +160,18 @@ func (m Manager) Remove() (returnErr error) {
 		return fmt.Errorf("remove cron %q: %w", path, err)
 	}
 	return nil
+}
+
+func destinationPresent(path string) (bool, error) {
+	var stat unix.Stat_t
+	err := unix.Lstat(path, &stat)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 type inspectedDestination struct {
@@ -244,12 +271,24 @@ func (m Manager) path() string {
 }
 
 func (m Manager) acquireMutationLock() (*os.File, error) {
+	return m.acquireMutationLockWithCreate(true)
+}
+
+func (m Manager) acquireExistingMutationLock() (*os.File, error) {
+	return m.acquireMutationLockWithCreate(false)
+}
+
+func (m Manager) acquireMutationLockWithCreate(create bool) (*os.File, error) {
 	path := m.path()
 	// The hidden lock file is intentionally stable and never unlinked: removing
 	// it could let concurrent processes lock different inodes. Its dot keeps
 	// cron daemons from treating it as a schedule fragment.
 	lockPath := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".lock")
-	fd, err := unix.Open(lockPath, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	flags := unix.O_RDWR | unix.O_CLOEXEC | unix.O_NOFOLLOW
+	if create {
+		flags |= unix.O_CREAT
+	}
+	fd, err := unix.Open(lockPath, flags, 0o600)
 	if err != nil {
 		return nil, err
 	}

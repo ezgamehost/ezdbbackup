@@ -62,6 +62,20 @@ func TestLogOptionsRejectsOverflow(t *testing.T) {
 	}
 }
 
+func TestLogOptionsRejectsUnreasonablyLargeRotationHistory(t *testing.T) {
+	_, err := logOptions(config.LoggingConfig{
+		Directory: "/var/log/ezdbbackup",
+		Rotation: config.RotationConfig{
+			MaxSizeMB:  1,
+			MaxFiles:   1001,
+			MaxAgeDays: 1,
+		},
+	}, false)
+	if err == nil {
+		t.Fatal("logOptions() accepted max_files above the supported bound")
+	}
+}
+
 func TestDefaultDependenciesComposeRealComponentsWithSharedResolver(t *testing.T) {
 	deps := DefaultDependencies()
 	if deps.Stdout != os.Stdout || deps.Stderr != os.Stderr || deps.Version == "" {

@@ -26,6 +26,18 @@ type writeCloseErrorWriter struct {
 func (w writeCloseErrorWriter) Write([]byte) (int, error) { return 0, w.err }
 func (w writeCloseErrorWriter) Close() error              { return w.err }
 
+type closeWritingWriter struct{ destination io.Writer }
+
+func (w closeWritingWriter) Write(value []byte) (int, error) { return len(value), nil }
+func (w closeWritingWriter) Close() error {
+	_, err := w.destination.Write([]byte("gzip trailer"))
+	return err
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(value []byte) (int, error) { return f(value) }
+
 type callbackTestError struct{ message string }
 
 func (e *callbackTestError) Error() string { return e.message }
@@ -465,6 +477,75 @@ func TestStageClassifiesCompressionWriteFailureBeforeCallbackError(t *testing.T)
 	}
 	if !errors.Is(err, compressionErr) {
 		t.Fatalf("Stage() error = %v, want original compression cause", err)
+	}
+}
+
+func TestStageReturnsTypedCompressionWriteErrorToDumpCallback(t *testing.T) {
+	compressionErr := errors.New("compressor write failed")
+	s := GzipStager{newWriter: func(io.Writer) gzipWriteCloser {
+		return writeCloseErrorWriter{err: compressionErr}
+	}}
+	var callbackWriteErr error
+
+	_, err := s.Stage(context.Background(), secureTempDir(t), func(writer io.Writer) error {
+		_, callbackWriteErr = io.WriteString(writer, "database dump")
+		return callbackWriteErr
+	})
+	var callbackStageErr *Error
+	if !errors.As(callbackWriteErr, &callbackStageErr) || callbackStageErr.Kind != FailureCompression {
+		t.Fatalf("callback write error = %v, want typed compression failure", callbackWriteErr)
+	}
+	if !errors.Is(err, compressionErr) {
+		t.Fatalf("Stage() error = %v, want original compression cause", err)
+	}
+}
+
+func TestStageReturnsTypedTemporaryStorageErrorFromGzipDestination(t *testing.T) {
+	storageErr := syscall.ENOSPC
+	s := GzipStager{
+		destinationWriter: func(io.Writer) io.Writer {
+			return writerFunc(func([]byte) (int, error) { return 0, storageErr })
+		},
+		newWriter: func(destination io.Writer) gzipWriteCloser {
+			return closeErrorWriter{Writer: destination}
+		},
+	}
+	var callbackWriteErr error
+
+	_, err := s.Stage(context.Background(), secureTempDir(t), func(writer io.Writer) error {
+		_, callbackWriteErr = io.WriteString(writer, "database dump")
+		return callbackWriteErr
+	})
+	var callbackStageErr *Error
+	if !errors.As(callbackWriteErr, &callbackStageErr) || callbackStageErr.Kind != FailureTemporaryStorage {
+		t.Fatalf("callback write error = %v, want typed temporary-storage failure", callbackWriteErr)
+	}
+	if !errors.Is(err, storageErr) {
+		t.Fatalf("Stage() error = %v, want ENOSPC cause", err)
+	}
+}
+
+func TestStagePreservesTemporaryStorageTypeWhenGzipCloseFlushesDestination(t *testing.T) {
+	storageErr := syscall.ENOSPC
+	s := GzipStager{
+		destinationWriter: func(io.Writer) io.Writer {
+			return writerFunc(func([]byte) (int, error) { return 0, storageErr })
+		},
+		newWriter: func(destination io.Writer) gzipWriteCloser {
+			return closeWritingWriter{destination: destination}
+		},
+	}
+
+	_, err := s.Stage(context.Background(), secureTempDir(t), func(writer io.Writer) error {
+		_, writeErr := io.WriteString(writer, "database dump")
+		return writeErr
+	})
+	var stageErr *Error
+	if !errors.As(err, &stageErr) || stageErr.Kind != FailureTemporaryStorage {
+		t.Fatalf("Stage() error = %v, want destination-owned temporary-storage failure", err)
+	}
+	if !errors.Is(err, storageErr) {
+		t.Fatalf("Stage() error = %v, want ENOSPC cause", err)
 	}
 }
 

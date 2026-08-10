@@ -458,6 +458,11 @@ func buildBinary(t *testing.T, ctx context.Context, repository, output, target s
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("build %s: %v\n%s", target, err, output)
 	}
+	// go build honors the process umask and commonly emits 0775. Production
+	// executable validation intentionally rejects group-writable programs.
+	if err := os.Chmod(output, 0o755); err != nil {
+		t.Fatalf("secure built test executable %s: %v", target, err)
+	}
 }
 
 func newS3Client(t *testing.T, ctx context.Context, endpoint string) *s3.Client {

@@ -15,7 +15,7 @@ import (
 )
 
 func TestRotationUsesSizeLimitAndRetainsMaxFiles(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureLogDir(t)
 	logger, err := New(Options{
 		Directory: dir,
 		Rotation:  RotationOptions{MaxSizeBytes: 256, MaxFiles: 2},
@@ -47,7 +47,7 @@ func TestRotationUsesSizeLimitAndRetainsMaxFiles(t *testing.T) {
 }
 
 func TestRotationDeletesFilesOlderThanMaxAgeUsingClock(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureLogDir(t)
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
 	logger, err := New(Options{
 		Directory: dir,
@@ -84,7 +84,7 @@ func TestRotationDeletesFilesOlderThanMaxAgeUsingClock(t *testing.T) {
 }
 
 func TestRotationCompressesOnlyRotatedLogAndPreservesContents(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureLogDir(t)
 	logger, err := New(Options{
 		Directory: dir,
 		Rotation:  RotationOptions{MaxSizeBytes: 256, MaxFiles: 2, Compress: true},
@@ -120,7 +120,7 @@ func TestRotationCompressesOnlyRotatedLogAndPreservesContents(t *testing.T) {
 }
 
 func TestRotationMaxFilesCountsMixedCompressedHistory(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureLogDir(t)
 	options := Options{
 		Directory: dir,
 		Rotation:  RotationOptions{MaxSizeBytes: 1, MaxFiles: 2, Compress: true},
@@ -162,7 +162,7 @@ func TestRotationMaxFilesCountsMixedCompressedHistory(t *testing.T) {
 }
 
 func TestConcurrentWritesRemainAtomicWhileForcedRotationOccurs(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureLogDir(t)
 	options := Options{
 		Directory: dir,
 		Rotation:  RotationOptions{MaxSizeBytes: 1, MaxFiles: 20, Compress: true},
@@ -224,7 +224,7 @@ func TestConcurrentWritesRemainAtomicWhileForcedRotationOccurs(t *testing.T) {
 }
 
 func TestAppendLineRollsBackPartialWrite(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "info.log")
+	path := filepath.Join(secureLogDir(t), "info.log")
 	initial := []byte("{\"message\":\"before\"}\n")
 	if err := os.WriteFile(path, initial, logFileMode); err != nil {
 		t.Fatal(err)

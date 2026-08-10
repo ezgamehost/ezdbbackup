@@ -459,6 +459,22 @@ func TestValidateRotationConversionBounds(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsUnreasonablyLargeRotationHistory(t *testing.T) {
+	cfg := validConfig()
+	cfg.Logging.Rotation.MaxFiles = 1001
+
+	findings := Validate(cfg)
+	found := false
+	for _, finding := range findings {
+		if !finding.Warning && finding.Path == "logging.rotation.max_files" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Validate() findings = %v, want max_files upper-bound error", findings)
+	}
+}
+
 // This fails if schedule validation follows a library dialect instead of the
 // numeric/name list-range-step grammar accepted by /etc/cron.d.
 func TestValidateCronDDialect(t *testing.T) {

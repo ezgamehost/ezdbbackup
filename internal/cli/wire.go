@@ -53,6 +53,9 @@ func DefaultDependencies() Dependencies {
 }
 
 func logOptions(configured config.LoggingConfig, invocationDebug bool) (logging.Options, error) {
+	if configured.Rotation.MaxFiles > logging.MaxRotationFiles {
+		return logging.Options{}, fmt.Errorf("max_files must not exceed %d", logging.MaxRotationFiles)
+	}
 	if int64(configured.Rotation.MaxSizeMB) > math.MaxInt64/(1024*1024) {
 		return logging.Options{}, fmt.Errorf("max_size_mb conversion overflow")
 	}

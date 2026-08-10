@@ -43,16 +43,37 @@ sudo install -o root -g ezdbbackup -m 0640 /path/to/mysql-password /etc/ezdbback
 ```
 
 Create the service account with the distribution's preferred account-management
-tool if `useradd` is unavailable. Secret files must be regular files readable
-by `run_as` and must have no permissions for “other”; mode `0640` with the
-service group is a typical choice. Give `run_as` traversal permission on all
-parent directories. Do not put a real secret on a command line or in shell
-history while provisioning it.
+tool if `useradd` is unavailable. The configuration and secret files must be
+regular, owned by root or the intended `run_as` user, readable by `run_as`, not
+group-writable, and have no permissions for “other”; mode `0640` with the
+service group is typical. The scheduled binary must likewise be root- or
+`run_as`-owned and must not be writable by group or other users. Give `run_as`
+traversal permission on every lexical and symlink-resolved parent directory.
+Do not put a real secret on a command line or in shell history while
+provisioning it.
 
-The binary creates a missing staging directory with mode `0700`, a missing log
-directory with mode `0750`, and log files with mode `0640`, but pre-creating
-them makes ownership explicit. A process cannot change an existing directory's
-ownership, so cron's `run_as` user must already be able to write both targets.
+The binary creates a missing staging directory with mode `0700`, a missing
+single-user log directory with mode `0750`, and private log objects with exact
+mode `0640`, but pre-creating them makes ownership explicit. A process cannot
+change an existing directory's ownership, so cron's `run_as` user must already
+be able to write both targets.
+
+When enabled jobs use distinct OS identities, the global log directory must
+already exist as a root-owned, setgid directory for a dedicated group shared by
+all those users. It must grant that group read, write, and search permission and
+must never be other-writable. For example:
+
+```sh
+sudo groupadd --system ezdbbackup-logs
+sudo usermod -a -G ezdbbackup-logs backup-a
+sudo usermod -a -G ezdbbackup-logs backup-b
+sudo install -d -o root -g ezdbbackup-logs -m 2770 /var/log/ezdbbackup
+```
+
+In this layout active logs, stable locks, rotations, and gzip files use exact
+mode `0660` and inherit the shared group. A missing directory is rejected for
+multiple identities so one job cannot accidentally create a private directory
+that blocks the others.
 
 ## Configure
 
@@ -118,11 +139,15 @@ flushing/deletion before selecting the configured databases. Disabling option
 files prevents inherited result-file, init-command, or replica controls from
 making a probe write files or change server state.
 
-Configured `dump_binary`, staging, log, and secret paths must be clean absolute
-paths. Local validation rejects a symbolic link in any component of those
-paths. Secret targets must be regular files; secret symlinks are not followed.
-The cron manager likewise refuses a symlink, non-regular file, or multiply
-hard-linked file at `/etc/cron.d/ezdbbackup`.
+Configured binary, configuration, staging, log, and secret paths must be clean
+absolute paths. Secure distribution-style symlinks are supported for binaries,
+configuration, secrets, and the log target: validation resolves the final
+target without following a final replacement, verifies its identity and type,
+and checks traversal through both the lexical and resolved paths. Staging keeps
+the stronger rule that every component must be symlink-free. Secret and
+configuration targets must be regular, single-link files. The cron manager
+likewise refuses a symlink, non-regular file, or multiply hard-linked file at
+`/etc/cron.d/ezdbbackup`.
 
 ### Secret sources
 
@@ -225,8 +250,16 @@ ezdbbackup version
 
 `backup <job>` requires that named job to exist and be enabled. `backup --all`
 runs enabled jobs sequentially in lexical job-name order, continues after an
-individual failure, prints a per-job summary, and fails overall if any job
-failed. Disabled jobs are excluded from `backup --all`.
+individual failure, prints each job's lifecycle progress immediately, then
+prints one aggregate summary and fails overall if any job failed. Disabled jobs
+are excluded from `backup --all`.
+
+`backup` fails closed unless its effective OS user matches every selected
+job's `run_as`; it never executes a configured dump binary with the invoking
+user's extra privileges. Consequently, a manual `backup --all` can select only
+jobs that share one OS identity. Cron schedules jobs independently under their
+configured identities, so configurations with distinct `run_as` users remain
+supported.
 
 `validate` with no selector is equivalent to `validate --all`; it includes
 disabled jobs so problems are caught before enabling them. An explicit job
@@ -243,32 +276,39 @@ Exit categories are stable:
 | `2` | Command usage, configuration, selection, or validation failed. |
 | `3` | Cron installation, display, or removal failed. |
 
-Errors and progress printed to the terminal are concise text. Operational
-backup details are JSON Lines in the configured log directory.
+Errors and progress printed to the terminal are concise text, never JSON. Each
+untrusted value is bounded to one physical line with terminal controls, bidi
+controls, and invalid UTF-8 rendered visibly. Operational backup details are
+JSON Lines in the configured log directory.
 
 ## Validation and execution identity
 
 Default validation is local and side-effect free. It validates the complete
-schema and cron-safe paths; checks `run_as`; verifies the configured dump
-binary is regular, traversable and executable; invokes it with `--version`;
-checks staging/log directory writability; and checks file-backed secrets. A
+schema and cron-safe paths; checks `run_as`; proves that every enabled
+`run_as` can traverse and execute both the configured dump binary and the
+current ezdbbackup binary, and can traverse and read the effective
+configuration; invokes executables with `--version`; checks staging/log
+directory policy; and checks file-backed secrets. A
 shared writable staging target or ancestor must be sticky (as `/tmp` normally
 is), and existing path ancestors must be owned by `run_as` or root. A missing
-staging or log directory is not created: validation checks whether `run_as`
-could create it beneath the nearest existing parent.
+staging or single-user log directory is not created: validation checks whether
+`run_as` could create it beneath the nearest existing parent. A global log
+directory shared by distinct identities must already exist with the setgid
+group policy described above.
 
 `--connectivity` adds a no-data/no-DDL MySQL probe and S3 `HeadBucket`. MySQL
 and S3 are reported separately. `HeadBucket` can be denied by a policy that
 still permits uploads, so that error is diagnostic rather than proof that an
 upload can never work.
 
-> **Important identity behavior:** filesystem permissions are evaluated from
-> metadata for each job's configured `run_as`, but the actual
-> `mysqldump --version` command and both connectivity probes run as the OS user
-> invoking ezdbbackup. v1 does not impersonate `run_as`. With
-> `--connectivity`, a different invoking user produces a warning. To reproduce
-> scheduled-job behavior, retain the same selector and configuration path and
-> run exactly the corresponding form:
+> **Important identity behavior:** filesystem permissions are evaluated for
+> each job's configured `run_as`. Executable `--version` probes also run as
+> `run_as` when validation is invoked by root; a same-user invocation keeps its
+> current identity, and an unprivileged cross-user invocation fails closed
+> instead of executing another user's binary. Connectivity probes still run as
+> the OS user invoking ezdbbackup. With `--connectivity`, a different invoking
+> user produces a warning. To reproduce scheduled-job behavior, retain the same
+> selector and configuration path and run exactly the corresponding form:
 >
 > `sudo -u <run_as> ezdbbackup validate [job|--all] --connectivity --config /absolute/path/to/config.yml`
 >
@@ -342,14 +382,27 @@ redacted. Error events go only to `error.log`; info and warning events go only
 to `info.log`; debug events go to `debug.log` only when `logging.debug: true`
 or backup's `--debug` flag enables debug mode. Required files are initialized
 before a dump starts, and a logging initialization failure prevents the dump.
+Debug mode records curated stage diagnostics such as option counts and safe
+booleans; it never records raw configuration, environment data, endpoints, or
+credentials.
 
-Rotation is built into the binary. Before a log write, it uses per-log
-inter-process locks, rotates at `max_size_mb`, retains at most `max_files`,
-removes rotations older than `max_age_days`, and optionally compresses rotated
-files according to `compress`. The example spells out all four settings so the
-operations policy is explicit; omitted settings receive the defaults described
-above. Do not configure system `logrotate` for these files: two rotation
-owners can race or defeat the built-in retention policy.
+Rotation is built into the binary. During logger initialization and before each
+log write, it uses stable per-family inter-process locks, rotates at
+`max_size_mb`, retains at most `max_files` (between 1 and 1000), removes
+rotations older than `max_age_days`, and optionally compresses rotated files
+according to `compress`. Initialization performs this maintenance for error,
+info, and enabled debug logs even when that run emits no event at a level. All
+filesystem operations are directory-descriptor-relative, reject links and
+unsafe replacements, and avoid overwriting unrelated entries. The example
+spells out all four settings so the operations policy is explicit; omitted
+settings receive the defaults described above. Do not configure system
+`logrotate` for these files: two rotation owners can race or defeat the
+built-in retention policy.
+
+Every lifecycle log write is part of the job result. A start or transition log
+failure stops the next dump/upload side effect; a completion log failure leaves
+the uploaded S3 object in place but reports the job as failed. Cleanup and
+failure-log errors are retained behind the earliest operational failure.
 
 ## Staging, cleanup, and object keys
 

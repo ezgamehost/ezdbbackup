@@ -64,8 +64,9 @@ type gzipWriteCloser interface {
 // GzipStager stores callback output in a private gzip file inside a unique
 // mode-0700 directory beneath the configured staging parent.
 type GzipStager struct {
-	removeFile func(string) error
-	newWriter  func(io.Writer) gzipWriteCloser
+	removeFile        func(string) error
+	newWriter         func(io.Writer) gzipWriteCloser
+	destinationWriter func(io.Writer) io.Writer
 }
 
 // Stage writes a gzip-compressed artifact in dir. Every unsuccessful staging
@@ -117,7 +118,12 @@ func (s GzipStager) Stage(ctx context.Context, dir string, write func(io.Writer)
 		artifact = Artifact{}
 	}()
 
-	writer := s.writer(file)
+	destination := io.Writer(file)
+	if s.destinationWriter != nil {
+		destination = s.destinationWriter(destination)
+	}
+	destination = classifiedWriter{destination: destination, kind: FailureTemporaryStorage}
+	writer := classifiedGzipWriter{gzip: s.writer(destination)}
 	writeErr := write(writer)
 	gzipCloseErr := writer.Close()
 	finalStat, statErr := statFileDescriptor(file)
@@ -132,13 +138,13 @@ func (s GzipStager) Stage(ctx context.Context, dir string, write func(io.Writer)
 		if gzipCloseErr != nil {
 			return Artifact{}, errors.Join(
 				writeErr,
-				stageError(FailureCompression, fmt.Errorf("close gzip staging file: %w", gzipCloseErr)),
+				contextualFailure(FailureCompression, "close gzip staging file", gzipCloseErr),
 			)
 		}
 		return Artifact{}, writeErr
 	}
 	if gzipCloseErr != nil {
-		return Artifact{}, stageError(FailureCompression, fmt.Errorf("close gzip staging file: %w", gzipCloseErr))
+		return Artifact{}, contextualFailure(FailureCompression, "close gzip staging file", gzipCloseErr)
 	}
 	if statErr != nil {
 		return Artifact{}, stageError(FailureTemporaryStorage, fmt.Errorf("inspect staging file: %w", statErr))
@@ -184,6 +190,49 @@ func (s GzipStager) writer(dst io.Writer) gzipWriteCloser {
 		return s.newWriter(dst)
 	}
 	return gzip.NewWriter(dst)
+}
+
+type classifiedWriter struct {
+	destination io.Writer
+	kind        FailureKind
+}
+
+func (w classifiedWriter) Write(value []byte) (int, error) {
+	written, err := w.destination.Write(value)
+	return written, classifyFailure(w.kind, err)
+}
+
+type classifiedGzipWriter struct {
+	gzip gzipWriteCloser
+}
+
+func (w classifiedGzipWriter) Write(value []byte) (int, error) {
+	written, err := w.gzip.Write(value)
+	return written, classifyFailure(FailureCompression, err)
+}
+
+func (w classifiedGzipWriter) Close() error {
+	return classifyFailure(FailureCompression, w.gzip.Close())
+}
+
+func classifyFailure(kind FailureKind, err error) error {
+	if err == nil {
+		return nil
+	}
+	var existing *Error
+	if errors.As(err, &existing) {
+		return err
+	}
+	return stageError(kind, err)
+}
+
+func contextualFailure(kind FailureKind, operation string, err error) error {
+	contextual := fmt.Errorf("%s: %w", operation, err)
+	var existing *Error
+	if errors.As(err, &existing) {
+		return contextual
+	}
+	return stageError(kind, contextual)
 }
 
 func stageError(kind FailureKind, err error) error {

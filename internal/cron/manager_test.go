@@ -189,10 +189,12 @@ func TestManagerRemoveRefusesUnmarkedFile(t *testing.T) {
 func TestManagerRemoveSucceedsWhenFileIsAbsent(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(t.TempDir(), "ezdbbackup")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ezdbbackup")
 	if err := (Manager{Path: path}).Remove(); err != nil {
 		t.Fatalf("Remove() error = %v", err)
 	}
+	assertDirectoryEntries(t, dir)
 }
 
 func TestManagerOperationsRejectSymlinkAndHardlinkDestinations(t *testing.T) {
@@ -375,6 +377,43 @@ func TestManagerConcurrentInstallThenRemoveIsSerialized(t *testing.T) {
 	if err := os.WriteFile(path, testManagedCron("original"), 0o644); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
+	renameEntered := make(chan struct{})
+	releaseRename := make(chan struct{})
+	install := Manager{
+		Path: path,
+		rename: func(oldPath, newPath string) error {
+			close(renameEntered)
+			<-releaseRename
+			return os.Rename(oldPath, newPath)
+		},
+	}
+	installDone := make(chan error, 1)
+	go func() { installDone <- install.Install(testManagedCron("installed")) }()
+	<-renameEntered
+
+	removeBlocked := make(chan struct{})
+	remove := Manager{Path: path, flock: expectContendedFlock(removeBlocked)}
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- remove.Remove() }()
+	assertOperationContendsOnLock(t, removeBlocked, removeDone)
+
+	close(releaseRename)
+	if err := <-installDone; err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if err := <-removeDone; err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Lstat() error = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestManagerRemoveWaitsForFirstInstallWhoseDestinationIsStillAbsent(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ezdbbackup")
 	renameEntered := make(chan struct{})
 	releaseRename := make(chan struct{})
 	install := Manager{

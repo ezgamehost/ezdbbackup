@@ -10,7 +10,7 @@ import (
 )
 
 func TestWriteRoutesAndRedacts(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureLogDir(t)
 	logger, err := New(Options{
 		Directory: dir,
 		Debug:     true,
@@ -46,7 +46,7 @@ func TestWriteRoutesAndRedacts(t *testing.T) {
 }
 
 func TestWriteRoutesEachLevelToOnlyItsDestination(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureLogDir(t)
 	logger, err := New(Options{Directory: dir, Debug: true})
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +69,7 @@ func TestWriteRoutesEachLevelToOnlyItsDestination(t *testing.T) {
 }
 
 func TestWriteOmitsDebugWhenDisabled(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureLogDir(t)
 	logger, err := New(Options{Directory: dir})
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func TestWriteOmitsDebugWhenDisabled(t *testing.T) {
 }
 
 func TestWriteDoesNotMutateFields(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureLogDir(t)
 	logger, err := New(Options{Directory: dir})
 	if err != nil {
 		t.Fatal(err)
@@ -110,7 +110,7 @@ func TestWriteRedactsKeysProducedByStructuredFieldValues(t *testing.T) {
 		Password string `json:"database_password"`
 		Safe     string `json:"safe"`
 	}
-	dir := t.TempDir()
+	dir := secureLogDir(t)
 	logger, err := New(Options{Directory: dir})
 	if err != nil {
 		t.Fatal(err)

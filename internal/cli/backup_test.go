@@ -57,7 +57,7 @@ func TestBackupAcceptsFlagsBeforeAndAfterJob(t *testing.T) {
 			if !loggerOptions.Debug {
 				t.Fatal("logger debug = false, want true")
 			}
-			if !reflect.DeepEqual(validator.jobs, []string{"alpha"}) || validator.options.Connectivity {
+			if !reflect.DeepEqual(validator.jobs, []string{"alpha"}) || validator.options.Connectivity || !validator.options.BackupExecution {
 				t.Fatalf("validation = jobs:%v options:%+v", validator.jobs, validator.options)
 			}
 			if !reflect.DeepEqual(runtime.dumps, []string{"alpha"}) {
@@ -295,7 +295,7 @@ func TestBackupAllRunsLexicallyContinuesAndSummarizes(t *testing.T) {
 		t.Fatalf("dump jobs = %v, want continuation in lexical order", runtime.dumps)
 	}
 	out := stdout.String()
-	alphaAt, zuluAt := strings.Index(out, "alpha: failed:"), strings.Index(out, "zulu: success:")
+	alphaAt, zuluAt := strings.Index(out, "alpha: failed at dump_execution:"), strings.Index(out, "zulu: upload complete ")
 	if alphaAt < 0 || zuluAt <= alphaAt || !strings.Contains(out, "backup summary: 1 succeeded, 1 failed\n") {
 		t.Fatalf("stdout = %q", out)
 	}
