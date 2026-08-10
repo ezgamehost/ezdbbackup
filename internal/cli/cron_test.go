@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,6 +14,143 @@ import (
 	"github.com/ezgamehost/ezdbbackup/internal/cron"
 	"github.com/ezgamehost/ezdbbackup/internal/validation"
 )
+
+// Rendering the originally requested sticky-directory symlink here would let
+// its owner redirect every future root cron invocation after installation.
+func TestCronInstallUsesLoadedCanonicalConfigPathAcrossSymlinkSwap(t *testing.T) {
+	root := secureCLITestDir(t)
+	shared := filepath.Join(root, "shared")
+	if err := os.Mkdir(shared, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+	trusted := filepath.Join(shared, "trusted.yml")
+	replacement := filepath.Join(shared, "replacement.yml")
+	writeCLIConfig(t, trusted)
+	writeCLIConfig(t, replacement)
+	link := filepath.Join(shared, "config.yml")
+	if err := os.Symlink(trusted, link); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	deps := fakeDependencies(&stdout, &stderr)
+	deps.LoadConfig = config.Load
+	deps.Validator = validatorFunc(func(context.Context, *config.Config, []string, validation.Options) validation.Report {
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(replacement, link); err != nil {
+			t.Fatal(err)
+		}
+		return validation.Report{}
+	})
+	manager := &recordingCron{}
+	deps.Cron = manager
+	deps.ExecutablePath = func() (string, error) { return "/usr/bin/true", nil }
+
+	if code := Run(context.Background(), []string{"cron", "install", "--config", link}, deps); code != 0 {
+		t.Fatalf("code = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(string(manager.installed), "--config '"+trusted+"'") {
+		t.Fatalf("installed schedule = %q, want canonical config %q", manager.installed, trusted)
+	}
+	if strings.Contains(string(manager.installed), "--config '"+link+"'") {
+		t.Fatalf("installed schedule retains replaceable symlink %q", link)
+	}
+}
+
+func TestCronInstallUsesCanonicalExecutableTarget(t *testing.T) {
+	root := secureCLITestDir(t)
+	target := filepath.Join(root, "ezdbbackup-target")
+	if err := os.WriteFile(target, []byte("binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "ezdbbackup")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	deps := fakeDependencies(&stdout, &stderr)
+	deps.LoadConfig = func(string) (*config.Config, config.Findings) { return cliTestConfig("alpha"), nil }
+	deps.Validator = &recordingValidator{}
+	manager := &recordingCron{}
+	deps.Cron = manager
+	deps.ExecutablePath = func() (string, error) { return link, nil }
+
+	if code := Run(context.Background(), []string{"cron", "install"}, deps); code != 0 {
+		t.Fatalf("code = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(string(manager.installed), "'"+target+"' backup") {
+		t.Fatalf("installed schedule = %q, want canonical executable %q", manager.installed, target)
+	}
+}
+
+// A canonical inode replacement after validation must be detected before the
+// cron manager can mutate /etc/cron.d.
+func TestCronInstallRejectsLoadedConfigInodeSwapBeforeMutation(t *testing.T) {
+	root := secureCLITestDir(t)
+	path := filepath.Join(root, "config.yml")
+	writeCLIConfig(t, path)
+
+	var stdout, stderr bytes.Buffer
+	deps := fakeDependencies(&stdout, &stderr)
+	deps.LoadConfig = config.Load
+	deps.Validator = validatorFunc(func(context.Context, *config.Config, []string, validation.Options) validation.Report {
+		if err := os.Rename(path, path+".original"); err != nil {
+			t.Fatal(err)
+		}
+		writeCLIConfig(t, path)
+		return validation.Report{}
+	})
+	manager := &recordingCron{}
+	deps.Cron = manager
+	deps.ExecutablePath = func() (string, error) { return "/usr/bin/true", nil }
+
+	if code := Run(context.Background(), []string{"cron", "install", "--config", path}, deps); code != 2 {
+		t.Fatalf("code = %d, stderr = %q; want source-safety exit 2", code, stderr.String())
+	}
+	if manager.installCalls != 0 {
+		t.Fatalf("cron install calls = %d, want zero", manager.installCalls)
+	}
+}
+
+type validatorFunc func(context.Context, *config.Config, []string, validation.Options) validation.Report
+
+func (fn validatorFunc) Check(ctx context.Context, cfg *config.Config, jobs []string, options validation.Options) validation.Report {
+	return fn(ctx, cfg, jobs, options)
+}
+
+func secureCLITestDir(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return directory
+}
+
+func writeCLIConfig(t *testing.T, path string) {
+	t.Helper()
+	contents := "version: 1\n" +
+		"jobs:\n" +
+		"  alpha:\n" +
+		"    enabled: true\n" +
+		"    schedule: '0 2 * * *'\n" +
+		"    run_as: root\n" +
+		"    mysql:\n" +
+		"      host: db.internal\n" +
+		"      user: backup\n" +
+		"      databases: all\n" +
+		"    s3:\n" +
+		"      bucket: backups\n" +
+		"      region: us-east-1\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestCronInstallValidatesAllJobsThenWritesExactSchedule(t *testing.T) {
 	var stdout, stderr bytes.Buffer

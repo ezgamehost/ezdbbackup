@@ -8,11 +8,13 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 
+	"github.com/ezgamehost/ezdbbackup/internal/securepath"
 	"golang.org/x/sys/unix"
 )
 
@@ -42,7 +44,8 @@ type stagingTargetEnvironment interface {
 // than the privileges of the validating process. These are point-in-time
 // validation checks; later execution is not atomic with validation.
 type OSEnvironment struct {
-	beforePathRecheck func(resolved string)
+	beforePathRecheck   func(resolved string)
+	readCredentialState func() (processCredentialState, error)
 }
 
 func (OSEnvironment) CheckUser(name string) error {
@@ -57,15 +60,161 @@ func (OSEnvironment) CheckUser(name string) error {
 
 // CheckRunIdentity prevents a backup from executing configured programs or
 // reading credentials with privileges different from its scheduled identity.
-func (OSEnvironment) CheckRunIdentity(name string) error {
+func (e OSEnvironment) CheckRunIdentity(name string) error {
 	identity, err := lookupIdentity(name)
 	if err != nil {
 		return err
 	}
-	if got := uint32(os.Geteuid()); got != identity.uid {
-		return fmt.Errorf("effective user ID %d does not match configured run_as user ID %d", got, identity.uid)
+	if identity.uid == 0 {
+		if got := uint32(os.Geteuid()); got != 0 {
+			return fmt.Errorf("effective user ID %d does not match configured run_as user ID 0", got)
+		}
+		return nil
+	}
+	state, err := e.credentialState()
+	if err != nil {
+		return err
+	}
+	return validateRunIdentityState(identity, state)
+}
+
+func (e OSEnvironment) credentialState() (processCredentialState, error) {
+	if e.readCredentialState != nil {
+		return e.readCredentialState()
+	}
+	return currentProcessCredentialState()
+}
+
+type processCredentialState struct {
+	ruid           uint32
+	euid           uint32
+	suid           uint32
+	fsuid          uint32
+	rgid           uint32
+	egid           uint32
+	sgid           uint32
+	fsgid          uint32
+	groups         map[uint32]struct{}
+	capEffective   uint64
+	capPermitted   uint64
+	capInheritable uint64
+}
+
+func currentProcessCredentialState() (processCredentialState, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	ruid, euid, suid := unix.Getresuid()
+	rgid, egid, sgid := unix.Getresgid()
+	fsuid, err := unix.SetfsuidRetUid(-1)
+	if err != nil {
+		return processCredentialState{}, fmt.Errorf("inspect filesystem user ID: %w", err)
+	}
+	fsgid, err := unix.SetfsgidRetGid(-1)
+	if err != nil {
+		return processCredentialState{}, fmt.Errorf("inspect filesystem group ID: %w", err)
+	}
+	groups, err := os.Getgroups()
+	if err != nil {
+		return processCredentialState{}, fmt.Errorf("inspect supplementary groups: %w", err)
+	}
+	ids := []struct {
+		label string
+		value int
+	}{
+		{label: "real user", value: ruid},
+		{label: "effective user", value: euid},
+		{label: "saved user", value: suid},
+		{label: "filesystem user", value: fsuid},
+		{label: "real group", value: rgid},
+		{label: "effective group", value: egid},
+		{label: "saved group", value: sgid},
+		{label: "filesystem group", value: fsgid},
+	}
+	for _, id := range ids {
+		if id.value < 0 {
+			return processCredentialState{}, fmt.Errorf("inspect %s ID: negative value", id.label)
+		}
+	}
+	state := processCredentialState{
+		ruid:   uint32(ruid),
+		euid:   uint32(euid),
+		suid:   uint32(suid),
+		fsuid:  uint32(fsuid),
+		rgid:   uint32(rgid),
+		egid:   uint32(egid),
+		sgid:   uint32(sgid),
+		fsgid:  uint32(fsgid),
+		groups: make(map[uint32]struct{}, len(groups)+1),
+	}
+	state.groups[state.egid] = struct{}{}
+	for _, group := range groups {
+		if group < 0 {
+			return processCredentialState{}, errors.New("inspect supplementary groups: negative group ID")
+		}
+		state.groups[uint32(group)] = struct{}{}
+	}
+	header := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	data := [2]unix.CapUserData{}
+	if err := unix.Capget(&header, &data[0]); err != nil {
+		return processCredentialState{}, fmt.Errorf("inspect Linux capability state: %w", err)
+	}
+	state.capEffective = uint64(data[0].Effective) | uint64(data[1].Effective)<<32
+	state.capPermitted = uint64(data[0].Permitted) | uint64(data[1].Permitted)<<32
+	state.capInheritable = uint64(data[0].Inheritable) | uint64(data[1].Inheritable)<<32
+	return state, nil
+}
+
+func validateRunIdentityState(identity userIdentity, state processCredentialState) error {
+	if state.euid != identity.uid {
+		return fmt.Errorf("effective user ID %d does not match configured run_as user ID %d", state.euid, identity.uid)
+	}
+	if identity.uid == 0 {
+		return nil
+	}
+	if state.ruid != identity.uid {
+		return fmt.Errorf("real user ID %d does not match configured run_as user ID %d", state.ruid, identity.uid)
+	}
+	if state.suid != identity.uid {
+		return fmt.Errorf("saved user ID %d does not match configured run_as user ID %d", state.suid, identity.uid)
+	}
+	if state.fsuid != identity.uid {
+		return fmt.Errorf("filesystem user ID %d does not match configured run_as user ID %d", state.fsuid, identity.uid)
+	}
+	if state.egid != identity.gid {
+		return fmt.Errorf("effective group ID %d does not match configured run_as primary group ID %d", state.egid, identity.gid)
+	}
+	if state.rgid != identity.gid {
+		return fmt.Errorf("real group ID %d does not match configured run_as primary group ID %d", state.rgid, identity.gid)
+	}
+	if state.sgid != identity.gid {
+		return fmt.Errorf("saved group ID %d does not match configured run_as primary group ID %d", state.sgid, identity.gid)
+	}
+	if state.fsgid != identity.gid {
+		return fmt.Errorf("filesystem group ID %d does not match configured run_as primary group ID %d", state.fsgid, identity.gid)
+	}
+	if !sameGroupSet(state.groups, identity.groups) {
+		return errors.New("supplementary group set does not match configured run_as ordinary login groups")
+	}
+	// Linux ambient capabilities are necessarily a subset of both permitted
+	// and inheritable capabilities, so requiring all three capget sets to be
+	// empty also excludes a retained ambient set.
+	if state.capEffective != 0 || state.capPermitted != 0 || state.capInheritable != 0 {
+		return errors.New("Linux capability state is not empty for non-root run_as")
 	}
 	return nil
+}
+
+func sameGroupSet(left, right map[uint32]struct{}) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for group := range left {
+		if _, ok := right[group]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (e OSEnvironment) CheckExecutable(ctx context.Context, path string) error {
@@ -85,36 +234,45 @@ func (e OSEnvironment) CheckRuntimeExecutable(ctx context.Context, path, runAs s
 	return e.checkExecutableAs(ctx, path, runAs, "version")
 }
 
-func (e OSEnvironment) checkExecutableAs(ctx context.Context, path, runAs, versionArgument string) error {
-	resolved, stat, closeTarget, err := e.inspectResolvedTarget(path)
-	if err != nil {
-		return fmt.Errorf("inspect executable %q: %w", path, err)
-	}
-	defer closeTarget()
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
-		return fmt.Errorf("executable %q must be a regular file", path)
-	}
-	if stat.Mode&0o022 != 0 {
-		return fmt.Errorf("executable %q is writable by group or other users", path)
-	}
+func (e OSEnvironment) checkExecutableAs(ctx context.Context, path, runAs, versionArgument string) (returnErr error) {
 	identity, err := lookupIdentity(runAs)
 	if err != nil {
 		return err
 	}
-	if !identity.allowsStat(stat, false, permissionExecute) {
-		return fmt.Errorf("executable %q is not executable by intended user %q", path, runAs)
+	executable, source, err := securepath.OpenRegular(path, securepath.Policy{
+		Label: "executable",
+		Identity: securepath.Identity{
+			UID: identity.uid, GID: identity.gid, Groups: identity.groups,
+		},
+		Access:   securepath.AccessExecute,
+		PathOnly: true,
+	})
+	if err != nil {
+		return fmt.Errorf("intended user %q cannot safely traverse or execute %q: %w", runAs, path, err)
 	}
-	if err := identity.checkLexicalAndResolvedTraversal(path, resolved); err != nil {
-		return fmt.Errorf("intended user %q cannot traverse executable path %q: %w", runAs, path, err)
+	defer func() { returnErr = errors.Join(returnErr, executable.Close()) }()
+	if e.beforePathRecheck != nil {
+		e.beforePathRecheck(source.CanonicalPath)
 	}
-	if stat.Uid != 0 && stat.Uid != identity.uid {
-		return fmt.Errorf("executable %q has an unrelated owner", path)
+	if err := securepath.RecheckPath(source); err != nil {
+		return fmt.Errorf("recheck executable %q: %w", path, err)
 	}
-	credential, err := versionProbeCredential(identity, uint32(os.Geteuid()))
+	invokingUID := uint32(os.Geteuid())
+	if identity.uid != 0 && invokingUID == identity.uid {
+		state, err := e.credentialState()
+		if err != nil {
+			return fmt.Errorf("inspect credentials before executable %q version probe: %w", path, err)
+		}
+		if err := validateRunIdentityState(identity, state); err != nil {
+			return fmt.Errorf("refuse executable %q version probe with mismatched process credentials: %w", path, err)
+		}
+	}
+	credential, err := versionProbeCredential(identity, invokingUID)
 	if err != nil {
 		return fmt.Errorf("prepare executable %q version probe: %w", path, err)
 	}
-	command := exec.CommandContext(ctx, resolved, versionArgument)
+	command := exec.CommandContext(ctx, path, versionArgument)
+	command.Args[0] = path
 	command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", "LC_ALL=C"}
 	if credential != nil {
 		command.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
@@ -236,6 +394,22 @@ func (e OSEnvironment) CheckConfigFile(path, runAs string) error {
 	return e.checkSensitiveFile(path, runAs, "configuration file")
 }
 
+// CheckConfigSource validates the descriptor metadata captured while the
+// configuration bytes were read. It deliberately never reopens the requested
+// pathname, which may be an independently replaceable symbolic link.
+func (e OSEnvironment) CheckConfigSource(source securepath.Source, runAs string) error {
+	identity, err := lookupIdentity(runAs)
+	if err != nil {
+		return err
+	}
+	if err := securepath.ValidateFor(source, securepath.Identity{
+		UID: identity.uid, GID: identity.gid, Groups: identity.groups,
+	}, securepath.AccessRead); err != nil {
+		return fmt.Errorf("inspect loaded configuration source %q: %w", source.CanonicalPath, err)
+	}
+	return nil
+}
+
 func (e OSEnvironment) checkSensitiveFile(path, runAs, label string) error {
 	resolved, stat, closeTarget, err := e.inspectResolvedTarget(path)
 	if err != nil {
@@ -349,6 +523,9 @@ func validateLogTargetDirectory(stat syscall.Stat_t, identities []userIdentity) 
 		return errors.New("log directory must not be writable by other users")
 	}
 	multipleUIDs := distinctUIDCount(identities) > 1
+	if stat.Mode&syscall.S_ISVTX != 0 && (multipleUIDs || stat.Mode&0o020 != 0) {
+		return errors.New("sticky log directories cannot provide reliable shared rotation")
+	}
 	if multipleUIDs && stat.Uid != 0 {
 		return errors.New("multiple run_as identities require a root-owned shared log directory")
 	}
@@ -512,6 +689,7 @@ func lookupIdentity(name string) (userIdentity, error) {
 		return userIdentity{}, err
 	}
 	identity := userIdentity{uid: uid, gid: gid, groups: make(map[uint32]struct{})}
+	identity.groups[gid] = struct{}{}
 	groupIDs, err := u.GroupIds()
 	if err != nil {
 		return userIdentity{}, fmt.Errorf("lookup groups for user %q: %w", name, err)

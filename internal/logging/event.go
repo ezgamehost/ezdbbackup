@@ -29,6 +29,7 @@ type Options struct {
 	Directory string
 	Debug     bool
 	Rotation  RotationOptions
+	Binding   *DirectoryBinding
 }
 
 type RotationOptions struct {

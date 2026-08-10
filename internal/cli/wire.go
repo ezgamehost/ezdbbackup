@@ -35,6 +35,11 @@ func DefaultDependencies() Dependencies {
 		Version:    buildinfo.String(),
 		LoadConfig: config.Load,
 		NewLogger: func(options logging.Options) (logging.Sink, error) {
+			binding, err := logging.BindDirectory(options.Directory)
+			if err != nil {
+				return nil, fmt.Errorf("bind validated log directory: %w", err)
+			}
+			options.Binding = binding
 			return logging.New(options)
 		},
 		NewBackup: func(sink logging.Sink) *backup.Service {

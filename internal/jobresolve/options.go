@@ -2,17 +2,21 @@
 package jobresolve
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/ezgamehost/ezdbbackup/internal/config"
 	"github.com/ezgamehost/ezdbbackup/internal/dump"
+	"github.com/ezgamehost/ezdbbackup/internal/securepath"
 	"github.com/ezgamehost/ezdbbackup/internal/storage"
 )
 
 // Resolver reads file-backed secrets while resolving a job for execution.
 type Resolver struct {
-	ReadFile func(string) ([]byte, error)
+	readFile        func(string) ([]byte, error)
+	afterSecretOpen func(*os.File)
 }
 
 // OptionsResolver resolves dump and storage options from a configured job.
@@ -23,12 +27,13 @@ type OptionsResolver interface {
 
 // Dump maps a job to a mysqldump request and resolves its password now.
 func (r Resolver) Dump(job config.JobConfig) (dump.Request, error) {
-	password, err := job.MySQL.PasswordRef().Resolve(r.readFile())
+	password, err := r.resolveSecret(job.MySQL.PasswordRef(), job.RunAs)
 	if err != nil {
 		return dump.Request{}, fmt.Errorf("resolve MySQL password: %w", err)
 	}
 	return dump.Request{
 		Binary:       job.DumpBinary,
+		RunAs:        job.RunAs,
 		Host:         job.MySQL.Host,
 		Port:         job.MySQL.Port,
 		User:         job.MySQL.User,
@@ -50,16 +55,15 @@ func (r Resolver) Storage(job config.JobConfig) (storage.Options, error) {
 		return options, nil
 	}
 
-	readFile := r.readFile()
-	accessKeyID, err := job.S3.AccessKeyIDRef().Resolve(readFile)
+	accessKeyID, err := r.resolveSecret(job.S3.AccessKeyIDRef(), job.RunAs)
 	if err != nil {
 		return storage.Options{}, fmt.Errorf("resolve S3 access key ID: %w", err)
 	}
-	secretAccessKey, err := job.S3.SecretAccessKeyRef().Resolve(readFile)
+	secretAccessKey, err := r.resolveSecret(job.S3.SecretAccessKeyRef(), job.RunAs)
 	if err != nil {
 		return storage.Options{}, fmt.Errorf("resolve S3 secret access key: %w", err)
 	}
-	sessionToken, err := job.S3.SessionTokenRef().Resolve(readFile)
+	sessionToken, err := r.resolveSecret(job.S3.SessionTokenRef(), job.RunAs)
 	if err != nil {
 		return storage.Options{}, fmt.Errorf("resolve S3 session token: %w", err)
 	}
@@ -72,9 +76,47 @@ func (r Resolver) Storage(job config.JobConfig) (storage.Options, error) {
 	return options, nil
 }
 
-func (r Resolver) readFile() func(string) ([]byte, error) {
-	if r.ReadFile != nil {
-		return r.ReadFile
+func (r Resolver) resolveSecret(reference config.SecretRef, runAs string) (value string, returnErr error) {
+	if reference.Literal != "" && reference.File != "" {
+		return "", errors.New("literal and file secret sources are mutually exclusive")
 	}
-	return os.ReadFile
+	if reference.File == "" {
+		return reference.Literal, nil
+	}
+	if r.readFile != nil {
+		return reference.Resolve(r.readFile)
+	}
+	identity, err := securepath.CurrentIdentity()
+	if runAs != "" {
+		identity, err = securepath.LookupIdentity(runAs)
+	}
+	if err != nil {
+		return "", err
+	}
+	file, source, err := securepath.OpenRegular(reference.File, securepath.Policy{
+		Label:                  "secret file",
+		Identity:               identity,
+		Access:                 securepath.AccessRead,
+		MaxBytes:               config.MaxSecretFileBytes,
+		RequireSingleLink:      true,
+		RejectOtherPermissions: true,
+	})
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close secret file: %w", closeErr))
+		}
+	}()
+	if r.afterSecretOpen != nil {
+		r.afterSecretOpen(file)
+	}
+	data, err := securepath.ReadAll(file, source, config.MaxSecretFileBytes)
+	if err != nil {
+		return "", err
+	}
+	defer clear(data)
+	trimmed := bytes.TrimRight(data, "\r\n")
+	return string(trimmed), nil
 }

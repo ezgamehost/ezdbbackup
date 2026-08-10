@@ -40,6 +40,7 @@ func runValidate(ctx context.Context, args []string, deps Dependencies) int {
 	if printConfigFindings(findings, deps) {
 		return 2
 	}
+	trustedConfig := cfg.TrustedPath(effectiveConfig)
 	binaryPath, err := executablePath(deps)
 	if err != nil {
 		fmt.Fprintf(deps.Stderr, "validation: %s\n", encoded(err))
@@ -52,7 +53,7 @@ func runValidate(ctx context.Context, args []string, deps Dependencies) int {
 	report := deps.Validator.Check(ctx, cfg, selected, validation.Options{
 		Connectivity: *connectivity,
 		BinaryPath:   binaryPath,
-		ConfigPath:   effectiveConfig,
+		ConfigPath:   trustedConfig,
 	})
 	if printValidationReport(report, deps) {
 		return 2

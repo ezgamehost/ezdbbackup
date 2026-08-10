@@ -44,6 +44,53 @@ type logDirectory struct {
 	fileMode   uint32
 }
 
+// DirectoryBinding carries a read-only descriptor snapshot from the final
+// pre-initialization check into New. Its fields are intentionally private so
+// callers cannot forge a trusted directory identity.
+type DirectoryBinding struct {
+	configured string
+	resolved   string
+	identity   logIdentity
+}
+
+// BindDirectory snapshots an existing configured log directory immediately
+// before logger initialization. A missing directory returns a nil binding;
+// New then creates it through the already descriptor-relative path walk.
+func BindDirectory(path string) (*DirectoryBinding, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, errors.New("log directory must be a clean absolute path")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := validateExistingLogSymlinkOwners(path); err != nil {
+			return nil, fmt.Errorf("unsafe existing lexical log symlink: %w", err)
+		}
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resolve log directory binding: %w", err)
+	}
+	directory, err := openLogDirectory(path, resolved, nil)
+	if err != nil {
+		return nil, err
+	}
+	binding := &DirectoryBinding{configured: path, resolved: resolved, identity: directory.identity}
+	if err := directory.close(); err != nil {
+		return nil, fmt.Errorf("close bound log directory: %w", err)
+	}
+	return binding, nil
+}
+
+func ensureBoundLogDirectory(path string, binding *DirectoryBinding) (*logDirectory, error) {
+	if binding == nil {
+		return ensureLogDirectory(path)
+	}
+	if binding.configured != path {
+		return nil, errors.New("log directory binding does not match configured path")
+	}
+	return openLogDirectory(path, binding.resolved, &binding.identity)
+}
+
 func ensureLogDirectory(path string) (*logDirectory, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return nil, errors.New("log directory must be a clean absolute path")
@@ -56,49 +103,62 @@ func ensureLogDirectory(path string) (*logDirectory, error) {
 		return nil, fmt.Errorf("resolve log directory: %w", err)
 	}
 
-	candidate := path
-	var missing []string
-	for {
-		resolved, err = filepath.EvalSymlinks(candidate)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("resolve existing log directory ancestor: %w", err)
-		}
-		parent := filepath.Dir(candidate)
-		if parent == candidate {
-			return nil, fmt.Errorf("find existing log directory ancestor for %q", path)
-		}
-		missing = append([]string{filepath.Base(candidate)}, missing...)
-		candidate = parent
-	}
+	return createMissingLogDirectory(path)
+}
 
-	fd, ancestorStat, err := openDirectoryDescriptor(resolved)
+// createMissingLogDirectory walks the lexical path from the filesystem root
+// without following any symlink. Existing configured directories may use
+// trusted symlinks, but creation must never mutate a target selected during a
+// racy pathname resolution.
+func createMissingLogDirectory(path string) (*logDirectory, error) {
+	return createMissingLogDirectoryWithHook(path, nil)
+}
+
+func createMissingLogDirectoryWithHook(path string, beforeComponentOpen func(string)) (*logDirectory, error) {
+	fd, err := unix.Open(string(filepath.Separator), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, fmt.Errorf("open existing log directory ancestor: %w", err)
+		return nil, fmt.Errorf("open log path root: %w", err)
 	}
-	if err := validateLogPathParent(ancestorStat); err != nil {
+	var currentStat unix.Stat_t
+	if err := unix.Fstat(fd, &currentStat); err != nil {
 		_ = unix.Close(fd)
-		return nil, fmt.Errorf("unsafe existing log directory ancestor: %w", err)
+		return nil, fmt.Errorf("inspect log path root: %w", err)
 	}
-	currentResolved := resolved
-	for index, component := range missing {
-		if component == "" || component == "." || component == ".." || strings.ContainsRune(component, filepath.Separator) {
-			_ = unix.Close(fd)
-			return nil, errors.New("invalid log directory path component")
+	if err := validateLogPathParent(currentStat); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("unsafe log path root: %w", err)
+	}
+	components := strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator))
+	remaining := 0
+	for _, component := range components {
+		if component != "" {
+			remaining++
 		}
-		mkdirErr := unix.Mkdirat(fd, component, logDirectoryMode)
-		if mkdirErr != nil && !errors.Is(mkdirErr, unix.EEXIST) {
-			_ = unix.Close(fd)
-			return nil, fmt.Errorf("create log directory component: %w", mkdirErr)
+	}
+	for _, component := range components {
+		if component == "" {
+			continue
+		}
+		remaining--
+		created := false
+		if beforeComponentOpen != nil {
+			beforeComponentOpen(component)
 		}
 		nextFD, openErr := unix.Openat(fd, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if errors.Is(openErr, unix.ENOENT) {
+			mkdirErr := unix.Mkdirat(fd, component, logDirectoryMode)
+			if mkdirErr != nil && !errors.Is(mkdirErr, unix.EEXIST) {
+				_ = unix.Close(fd)
+				return nil, fmt.Errorf("create log directory component %q: %w", component, mkdirErr)
+			}
+			created = mkdirErr == nil
+			nextFD, openErr = unix.Openat(fd, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		}
 		if openErr != nil {
 			_ = unix.Close(fd)
-			return nil, fmt.Errorf("open log directory component without following links: %w", openErr)
+			return nil, fmt.Errorf("open log directory component %q without following links: %w", component, openErr)
 		}
-		if mkdirErr == nil {
+		if created {
 			if err := unix.Fchmod(nextFD, logDirectoryMode); err != nil {
 				_ = unix.Close(nextFD)
 				_ = unix.Close(fd)
@@ -122,7 +182,7 @@ func ensureLogDirectory(path string) (*logDirectory, error) {
 			_ = unix.Close(fd)
 			return nil, errors.New("log directory component changed while opening")
 		}
-		if index < len(missing)-1 {
+		if remaining > 0 {
 			if err := validateLogPathParent(nextStat); err != nil {
 				_ = unix.Close(nextFD)
 				_ = unix.Close(fd)
@@ -134,12 +194,23 @@ func ensureLogDirectory(path string) (*logDirectory, error) {
 			return nil, fmt.Errorf("close log directory ancestor: %w", err)
 		}
 		fd = nextFD
-		currentResolved = filepath.Join(currentResolved, component)
+		currentStat = nextStat
 	}
-	if err := unix.Close(fd); err != nil {
-		return nil, fmt.Errorf("close created log directory: %w", err)
+	shared, fileMode, err := validateLogDirectory(currentStat)
+	if err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("unsafe log directory: %w", err)
 	}
-	return openLogDirectory(path, currentResolved, nil)
+	return &logDirectory{
+		fd:         fd,
+		configured: path,
+		resolved:   path,
+		identity:   identityFromStat(currentStat),
+		uid:        currentStat.Uid,
+		gid:        currentStat.Gid,
+		shared:     shared,
+		fileMode:   fileMode,
+	}, nil
 }
 
 func reopenLogDirectory(path string, expected logIdentity) (*logDirectory, error) {
@@ -151,6 +222,9 @@ func reopenLogDirectory(path string, expected logIdentity) (*logDirectory, error
 }
 
 func openLogDirectory(configured, resolved string, expected *logIdentity) (*logDirectory, error) {
+	if err := validateLogSymlinkOwners(configured); err != nil {
+		return nil, fmt.Errorf("unsafe lexical log symlink: %w", err)
+	}
 	if err := validateLogPathParents(configured); err != nil {
 		return nil, fmt.Errorf("unsafe lexical log path: %w", err)
 	}
@@ -171,6 +245,9 @@ func openLogDirectory(configured, resolved string, expected *logIdentity) (*logD
 	}
 	if currentResolved != resolved {
 		return nil, errors.New("configured log directory changed while opening")
+	}
+	if err := validateLogSymlinkOwners(configured); err != nil {
+		return nil, fmt.Errorf("unsafe lexical log symlink after open: %w", err)
 	}
 	if err := validateLogPathParents(configured); err != nil {
 		return nil, fmt.Errorf("unsafe lexical log path after open: %w", err)
@@ -193,6 +270,35 @@ func openLogDirectory(configured, resolved string, expected *logIdentity) (*logD
 		shared:     shared,
 		fileMode:   fileMode,
 	}, nil
+}
+
+func validateLogSymlinkOwners(path string) error {
+	return validateLogSymlinkOwnersUntilMissing(path, false)
+}
+
+func validateExistingLogSymlinkOwners(path string) error {
+	return validateLogSymlinkOwnersUntilMissing(path, true)
+}
+
+func validateLogSymlinkOwnersUntilMissing(path string, allowMissing bool) error {
+	current := string(filepath.Separator)
+	for _, component := range strings.Split(strings.TrimPrefix(filepath.Clean(path), current), current) {
+		if component == "" {
+			continue
+		}
+		current = filepath.Join(current, component)
+		var stat unix.Stat_t
+		if err := unix.Lstat(current, &stat); err != nil {
+			if allowMissing && errors.Is(err, unix.ENOENT) {
+				return nil
+			}
+			return fmt.Errorf("inspect path component %q: %w", current, err)
+		}
+		if stat.Mode&unix.S_IFMT == unix.S_IFLNK && stat.Uid != 0 && stat.Uid != uint32(os.Geteuid()) {
+			return fmt.Errorf("symbolic link %q has an unrelated owner", current)
+		}
+	}
+	return nil
 }
 
 func openDirectoryDescriptor(path string) (int, unix.Stat_t, error) {
@@ -317,6 +423,9 @@ func validateLogDirectory(stat unix.Stat_t) (bool, uint32, error) {
 	}
 	shared := stat.Mode&0o020 != 0
 	if shared {
+		if stat.Mode&unix.S_ISVTX != 0 {
+			return false, 0, errors.New("sticky shared log directory cannot rotate entries owned by another identity")
+		}
 		if stat.Mode&unix.S_ISGID == 0 {
 			return false, 0, fmt.Errorf("group-writable directory mode %#o must be setgid", stat.Mode)
 		}

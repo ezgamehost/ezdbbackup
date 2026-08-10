@@ -48,6 +48,73 @@ func TestExecRunnerRunStreamsOutputAndIsolatesPassword(t *testing.T) {
 	}
 }
 
+func TestExecRunnerPreservesShebangScriptArgvZero(t *testing.T) {
+	directory := secureDumpTestDir(t)
+	argvZeroPath := filepath.Join(directory, "argv-zero")
+	script := filepath.Join(directory, "mysqldump-wrapper")
+	contents := "#!/bin/sh\nprintf '%s\\n' \"$0\" > " + shellQuote(argvZeroPath) + "\nprintf 'dump contents\\n'\n"
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := (ExecRunner{}).Run(context.Background(), Request{Binary: script}, &output); err != nil {
+		t.Fatalf("Run(script) error = %v", err)
+	}
+	if got := strings.TrimSpace(readFixtureFile(t, argvZeroPath)); got != script {
+		t.Fatalf("script argv[0] = %q, want configured path %q", got, script)
+	}
+	if output.String() != "dump contents\n" {
+		t.Fatalf("script output = %q", output.String())
+	}
+}
+
+// Following req.Binary after this hook without rechecking its trusted path
+// association would run the attacker fixture. The invocation must fail closed
+// and close its validation descriptor.
+func TestExecRunnerRejectsFinalSymlinkSwapAfterDescriptorValidation(t *testing.T) {
+	directory := secureDumpTestDir(t)
+	trusted := filepath.Join(directory, "trusted")
+	attacker := filepath.Join(directory, "attacker")
+	attackerMarker := filepath.Join(directory, "attacker-ran")
+	if err := os.WriteFile(trusted, []byte("#!/bin/sh\nprintf 'trusted output\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(attacker, []byte("#!/bin/sh\n: > "+shellQuote(attackerMarker)+"\nprintf 'attacker output\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(directory, "mysqldump")
+	if err := os.Symlink(trusted, link); err != nil {
+		t.Fatal(err)
+	}
+	var pinned *os.File
+	runner := ExecRunner{afterExecutableOpen: func(file *os.File) {
+		pinned = file
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(attacker, link); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	var output bytes.Buffer
+	err := runner.Run(context.Background(), Request{Binary: link}, &output)
+	if err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("Run(swapped path) error = %v, want path-association rejection", err)
+	}
+	if got := output.String(); got != "" {
+		t.Fatalf("dump output = %q, want no executable output", got)
+	}
+	if _, err := os.Stat(attackerMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("attacker marker stat error = %v, want attacker never executed", err)
+	}
+	if pinned == nil {
+		t.Fatal("executable-open hook did not receive descriptor")
+	}
+	if _, err := pinned.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("pinned executable Stat() error = %v, want closed descriptor", err)
+	}
+}
+
 // This fails if a missing resolved password accidentally leaks MYSQL_PWD from
 // the parent into mysqldump.
 func TestExecRunnerRunRemovesInheritedPasswordWhenRequestHasNone(t *testing.T) {
@@ -392,7 +459,7 @@ func referenceRedaction(input, secret string) string {
 
 func writeFixture(t *testing.T, mode, passwordPath, argsPath string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "mysqldump-fixture")
+	path := filepath.Join(secureDumpTestDir(t), "mysqldump-fixture")
 	script := "#!/bin/sh\n" +
 		"printf '%s\\n' \"${MYSQL_PWD}\" > " + shellQuote(passwordPath) + "\n" +
 		"printf '%s\\n' \"$@\" > " + shellQuote(argsPath) + "\n" +
@@ -413,7 +480,7 @@ func writeFixture(t *testing.T, mode, passwordPath, argsPath string) string {
 
 func writeEnvironmentFixture(t *testing.T, envPath string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "mysqldump-environment-fixture")
+	path := filepath.Join(secureDumpTestDir(t), "mysqldump-environment-fixture")
 	script := "#!/bin/sh\n" +
 		"env > " + shellQuote(envPath) + "\n" +
 		"printf 'dump contents\\n'\n"
@@ -440,7 +507,7 @@ func (w errorWriter) Write([]byte) (int, error) { return 0, w.err }
 
 func writeStderrFailureFixture(t *testing.T, writes []string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "mysqldump-stderr-fixture")
+	path := filepath.Join(secureDumpTestDir(t), "mysqldump-stderr-fixture")
 	var script strings.Builder
 	script.WriteString("#!/bin/sh\n")
 	for _, value := range writes {
@@ -453,6 +520,15 @@ func writeStderrFailureFixture(t *testing.T, writes []string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func secureDumpTestDir(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return directory
 }
 
 func shellQuote(value string) string {

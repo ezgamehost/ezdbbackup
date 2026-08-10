@@ -11,6 +11,7 @@ import (
 // Request describes a validated mysqldump invocation.
 type Request struct {
 	Binary       string
+	RunAs        string
 	Host         string
 	Port         int
 	User         string

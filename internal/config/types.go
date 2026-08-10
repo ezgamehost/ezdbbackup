@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/ezgamehost/ezdbbackup/internal/securepath"
 )
 
 const (
@@ -19,6 +21,7 @@ type Config struct {
 	Defaults Defaults             `yaml:"defaults"`
 	Logging  LoggingConfig        `yaml:"logging"`
 	Jobs     map[string]JobConfig `yaml:"jobs"`
+	source   *securepath.Source
 }
 
 type Defaults struct {
@@ -163,4 +166,31 @@ func (c *Config) EnabledJobNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// Source returns the exact file identity used by Load. Configurations decoded
+// from an arbitrary reader intentionally have no filesystem source.
+func (c *Config) Source() (securepath.Source, bool) {
+	if c == nil || c.source == nil {
+		return securepath.Source{}, false
+	}
+	return *c.source, true
+}
+
+// TrustedPath returns the canonical non-replaceable source path when this
+// configuration came from Load, or fallback for reader-decoded test values.
+func (c *Config) TrustedPath(fallback string) string {
+	if source, ok := c.Source(); ok {
+		return source.CanonicalPath
+	}
+	return fallback
+}
+
+// RecheckSource proves that the trusted canonical path still names the exact
+// file parsed by Load.
+func (c *Config) RecheckSource() error {
+	if source, ok := c.Source(); ok {
+		return securepath.Recheck(source)
+	}
+	return nil
 }

@@ -1,9 +1,11 @@
 package validation
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -11,6 +13,10 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/ezgamehost/ezdbbackup/internal/config"
+	"github.com/ezgamehost/ezdbbackup/internal/dump"
+	"github.com/ezgamehost/ezdbbackup/internal/jobresolve"
 )
 
 func TestReportAggregatesFindingsAndDetectsErrors(t *testing.T) {
@@ -563,6 +569,52 @@ func TestOSEnvironmentConfigFileAllowsSecureSymlink(t *testing.T) {
 	}
 }
 
+// Reopening source.RequestedPath here would inspect the second file rather
+// than the descriptor-backed source whose bytes were actually decoded.
+func TestOSEnvironmentChecksExactLoadedConfigurationSource(t *testing.T) {
+	requireLinux(t)
+	dir := secureValidationDir(t)
+	first := filepath.Join(dir, "config-first.yml")
+	second := filepath.Join(dir, "config-second.yml")
+	for _, target := range []string{first, second} {
+		if err := os.WriteFile(target, []byte("version: 1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(dir, "config.yml")
+	if err := os.Symlink(first, link); err != nil {
+		t.Fatal(err)
+	}
+	cfg, findings := config.Load(link)
+	if findings.HasErrors() {
+		t.Fatalf("Load() findings = %v", findings)
+	}
+	source, ok := cfg.Source()
+	if !ok {
+		t.Fatal("loaded configuration has no source")
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(second, link); err != nil {
+		t.Fatal(err)
+	}
+
+	env := OSEnvironment{}
+	if err := env.CheckConfigSource(source, currentUsername(t)); err != nil {
+		t.Fatalf("CheckConfigSource(exact unchanged source) error = %v", err)
+	}
+	if err := os.Rename(first, first+".original"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(first, []byte("version: 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.CheckConfigSource(source, currentUsername(t)); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("CheckConfigSource(replaced source) error = %v, want identity rejection", err)
+	}
+}
+
 func TestOSEnvironmentRejectsSymlinkRepointedDuringInspection(t *testing.T) {
 	requireLinux(t)
 	dir := secureValidationDir(t)
@@ -592,6 +644,49 @@ func TestOSEnvironmentRejectsSymlinkRepointedDuringInspection(t *testing.T) {
 	}
 }
 
+// An earlier CheckSecretFile result must not authorize a later plain pathname
+// read after a sticky-directory symlink has been substituted.
+func TestValidatedSecretSymlinkSubstitutionIsRejectedAtResolution(t *testing.T) {
+	requireLinux(t)
+	root := secureValidationDir(t)
+	shared := filepath.Join(root, "shared")
+	if err := os.Mkdir(shared, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+	trusted := filepath.Join(shared, "trusted-secret")
+	attacker := filepath.Join(shared, "attacker-secret")
+	if err := os.WriteFile(trusted, []byte("trusted\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(attacker, []byte("attacker\n"), 0o660); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(shared, "mysql-secret")
+	if err := os.Symlink(trusted, link); err != nil {
+		t.Fatal(err)
+	}
+	runAs := currentUsername(t)
+	if err := (OSEnvironment{}).CheckSecretFile(link, runAs); err != nil {
+		t.Fatalf("initial CheckSecretFile() error = %v", err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(attacker, link); err != nil {
+		t.Fatal(err)
+	}
+	request, err := (jobresolve.Resolver{}).Dump(config.JobConfig{
+		RunAs: runAs,
+		MySQL: config.MySQLConfig{PasswordFile: link},
+	})
+	if err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("Dump(swapped secret) = %#v, error = %v; want point-of-use rejection", request, err)
+	}
+}
+
 func TestOSEnvironmentRejectsWritableExecutableAndPathSwap(t *testing.T) {
 	requireLinux(t)
 	dir := secureValidationDir(t)
@@ -618,6 +713,210 @@ func TestOSEnvironmentRejectsWritableExecutableAndPathSwap(t *testing.T) {
 	}
 }
 
+func TestOSEnvironmentSameUIDVersionProbeRejectsRetainedPrivilege(t *testing.T) {
+	requireLinux(t)
+	if os.Geteuid() == 0 {
+		t.Skip("root run_as may intentionally retain root privileges")
+	}
+	directory := secureValidationDir(t)
+	marker := filepath.Join(directory, "probe-ran")
+	path := filepath.Join(directory, "mysqldump")
+	writeExecutable(t, path, "#!/bin/sh\n: > "+strconv.Quote(marker)+"\n")
+	state, err := currentProcessCredentialState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.capPermitted = 1
+	env := OSEnvironment{readCredentialState: func() (processCredentialState, error) {
+		return state, nil
+	}}
+	if err := env.CheckExecutableAs(context.Background(), path, currentUsername(t)); err == nil || !strings.Contains(err.Error(), "capability") {
+		t.Fatalf("CheckExecutableAs(retained capability) error = %v", err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("version probe marker stat error = %v, want configured code not executed", err)
+	}
+}
+
+// When run as root this directly exercises both a root job and a cross-user
+// job through an attacker-owned symlink in a sticky directory. The substitute
+// executable must never run after the earlier validation succeeds.
+func TestValidatedExecutableStickySymlinkSwapNeverRunsUnrelatedOwner(t *testing.T) {
+	requireLinux(t)
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to construct distinct executable owners and credentials")
+	}
+	rootAccount, err := user.LookupId("0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonRoot := lookupDistinctNonRootUsers(t, 2)
+	tests := []struct {
+		name     string
+		runAs    *user.User
+		attacker *user.User
+	}{
+		{name: "root job", runAs: rootAccount, attacker: nonRoot[0]},
+		{name: "cross user job", runAs: nonRoot[0], attacker: nonRoot[1]},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			directory, err := os.MkdirTemp("/tmp", "ezdbbackup-exec-swap-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(directory) })
+			if err := os.Chmod(directory, os.ModeSticky|0o777); err != nil {
+				t.Fatal(err)
+			}
+			trusted := filepath.Join(directory, "trusted")
+			attacker := filepath.Join(directory, "attacker")
+			marker := filepath.Join(directory, "attacker-ran")
+			writeOwnedExecutable(t, trusted, "#!/bin/sh\nexit 0\n", tt.runAs)
+			writeOwnedExecutable(t, attacker, "#!/bin/sh\n: > \""+marker+"\"\n", tt.attacker)
+			link := filepath.Join(directory, "mysqldump")
+			if err := os.Symlink(trusted, link); err != nil {
+				t.Fatal(err)
+			}
+			runAsUID, _ := strconv.Atoi(tt.runAs.Uid)
+			runAsGID, _ := strconv.Atoi(tt.runAs.Gid)
+			if err := os.Lchown(link, runAsUID, runAsGID); err != nil {
+				t.Fatal(err)
+			}
+			if err := (OSEnvironment{}).CheckExecutableAs(context.Background(), link, tt.runAs.Username); err != nil {
+				t.Fatalf("initial executable validation error = %v", err)
+			}
+			if err := os.Remove(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(attacker, link); err != nil {
+				t.Fatal(err)
+			}
+			attackerUID, _ := strconv.Atoi(tt.attacker.Uid)
+			attackerGID, _ := strconv.Atoi(tt.attacker.Gid)
+			if err := os.Lchown(link, attackerUID, attackerGID); err != nil {
+				t.Fatal(err)
+			}
+
+			err = (dump.ExecRunner{}).Run(context.Background(), dump.Request{
+				Binary: link,
+				RunAs:  tt.runAs.Username,
+			}, &bytes.Buffer{})
+			if err == nil || !strings.Contains(err.Error(), "unrelated owner") {
+				t.Fatalf("Run(swapped executable) error = %v, want unrelated-owner rejection", err)
+			}
+			if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("attacker marker stat error = %v, want attacker never executed", statErr)
+			}
+		})
+	}
+}
+
+func TestResolvedSecretStickySymlinkSwapRejectsUnrelatedOwner(t *testing.T) {
+	requireLinux(t)
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to construct distinct secret owners")
+	}
+	rootAccount, err := user.LookupId("0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonRoot := lookupDistinctNonRootUsers(t, 2)
+	for _, tt := range []struct {
+		name     string
+		runAs    *user.User
+		attacker *user.User
+	}{
+		{name: "root job", runAs: rootAccount, attacker: nonRoot[0]},
+		{name: "cross user job", runAs: nonRoot[0], attacker: nonRoot[1]},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			directory, err := os.MkdirTemp("/tmp", "ezdbbackup-secret-swap-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(directory) })
+			if err := os.Chmod(directory, os.ModeSticky|0o777); err != nil {
+				t.Fatal(err)
+			}
+			trusted := filepath.Join(directory, "trusted")
+			attacker := filepath.Join(directory, "attacker")
+			writeOwnedFile(t, trusted, "trusted\n", 0o600, tt.runAs)
+			writeOwnedFile(t, attacker, "attacker\n", 0o600, tt.attacker)
+			link := filepath.Join(directory, "secret")
+			if err := os.Symlink(trusted, link); err != nil {
+				t.Fatal(err)
+			}
+			if err := (OSEnvironment{}).CheckSecretFile(link, tt.runAs.Username); err != nil {
+				t.Fatalf("initial CheckSecretFile() error = %v", err)
+			}
+			if err := os.Remove(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(attacker, link); err != nil {
+				t.Fatal(err)
+			}
+			attackerUID, _ := strconv.Atoi(tt.attacker.Uid)
+			attackerGID, _ := strconv.Atoi(tt.attacker.Gid)
+			if err := os.Lchown(link, attackerUID, attackerGID); err != nil {
+				t.Fatal(err)
+			}
+			_, err = (jobresolve.Resolver{}).Dump(config.JobConfig{
+				RunAs: tt.runAs.Username,
+				MySQL: config.MySQLConfig{PasswordFile: link},
+			})
+			if err == nil || !strings.Contains(err.Error(), "unrelated owner") {
+				t.Fatalf("Dump(swapped unrelated secret) error = %v", err)
+			}
+		})
+	}
+}
+
+func writeOwnedExecutable(t *testing.T, path, contents string, owner *user.User) {
+	t.Helper()
+	writeOwnedFile(t, path, contents, 0o700, owner)
+}
+
+func writeOwnedFile(t *testing.T, path, contents string, mode os.FileMode, owner *user.User) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), mode); err != nil {
+		t.Fatal(err)
+	}
+	uid, err := strconv.Atoi(owner.Uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid, err := strconv.Atoi(owner.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(path, uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func lookupDistinctNonRootUsers(t *testing.T, count int) []*user.User {
+	t.Helper()
+	var accounts []*user.User
+	seen := map[string]bool{"0": true}
+	for _, name := range []string{"nobody", "daemon", "www-data", "bin", "sys"} {
+		account, err := user.Lookup(name)
+		if err != nil || seen[account.Uid] {
+			continue
+		}
+		seen[account.Uid] = true
+		accounts = append(accounts, account)
+		if len(accounts) == count {
+			return accounts
+		}
+	}
+	t.Skipf("need %d distinct non-root local users", count)
+	return nil
+}
+
 func TestLogDirectoryPolicySameUserSharedGroupAndIncompatibleUsers(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -637,6 +936,26 @@ func TestLogDirectoryPolicySameUserSharedGroupAndIncompatibleUsers(t *testing.T)
 				{uid: 1000, groups: map[uint32]struct{}{2000: {}}},
 				{uid: 1001, groups: map[uint32]struct{}{2000: {}}},
 			},
+		},
+		{
+			name: "sticky shared group cannot rotate cross user",
+			stat: syscall.Stat_t{Uid: 0, Gid: 2000, Mode: syscall.S_IFDIR | syscall.S_ISGID | syscall.S_ISVTX | 0o770},
+			identities: []userIdentity{
+				{uid: 1000, groups: map[uint32]struct{}{2000: {}}},
+				{uid: 1001, groups: map[uint32]struct{}{2000: {}}},
+			},
+			wantErr: true,
+		},
+		{
+			name:       "sticky group writable directory is shared even for one configured user",
+			stat:       syscall.Stat_t{Uid: 1000, Gid: 2000, Mode: syscall.S_IFDIR | syscall.S_ISGID | syscall.S_ISVTX | 0o770},
+			identities: []userIdentity{{uid: 1000, groups: map[uint32]struct{}{2000: {}}}},
+			wantErr:    true,
+		},
+		{
+			name:       "private owner sticky directory remains mutable by owner",
+			stat:       syscall.Stat_t{Uid: 1000, Gid: 1000, Mode: syscall.S_IFDIR | syscall.S_ISVTX | 0o700},
+			identities: []userIdentity{{uid: 1000, groups: map[uint32]struct{}{1000: {}}}},
 		},
 		{
 			name: "root and nonroot shared setgid group",
@@ -801,6 +1120,144 @@ func TestOSEnvironmentUserAndCronPathRules(t *testing.T) {
 			t.Fatalf("CheckCronPath(%q) error = nil", invalid)
 		}
 	}
+}
+
+// Checking EUID alone would accept a process that retained a privileged
+// primary group, supplementary group, or Linux capability across setuid.
+func TestRunIdentityStateRequiresOrdinaryNonRootLoginCredentials(t *testing.T) {
+	identity := userIdentity{
+		uid: 1000,
+		gid: 100,
+		groups: map[uint32]struct{}{
+			100: {},
+			200: {},
+		},
+	}
+	valid := processCredentialState{
+		ruid:  1000,
+		euid:  1000,
+		suid:  1000,
+		fsuid: 1000,
+		rgid:  100,
+		egid:  100,
+		sgid:  100,
+		fsgid: 100,
+		groups: map[uint32]struct{}{
+			100: {},
+			200: {},
+		},
+	}
+	tests := []struct {
+		name  string
+		state processCredentialState
+		want  string
+	}{
+		{name: "valid ordinary login", state: valid},
+		{name: "wrong effective uid", state: withCredentialState(valid, func(state *processCredentialState) { state.euid = 0 }), want: "effective user"},
+		{name: "retained real uid", state: withCredentialState(valid, func(state *processCredentialState) { state.ruid = 0 }), want: "real user"},
+		{name: "retained saved uid", state: withCredentialState(valid, func(state *processCredentialState) { state.suid = 0 }), want: "saved user"},
+		{name: "retained filesystem uid", state: withCredentialState(valid, func(state *processCredentialState) { state.fsuid = 0 }), want: "filesystem user"},
+		{name: "retained primary gid", state: withCredentialState(valid, func(state *processCredentialState) { state.egid = 0 }), want: "effective group"},
+		{name: "retained real gid", state: withCredentialState(valid, func(state *processCredentialState) { state.rgid = 0 }), want: "real group"},
+		{name: "retained saved gid", state: withCredentialState(valid, func(state *processCredentialState) { state.sgid = 0 }), want: "saved group"},
+		{name: "retained filesystem gid", state: withCredentialState(valid, func(state *processCredentialState) { state.fsgid = 0 }), want: "filesystem group"},
+		{name: "missing login group", state: withCredentialState(valid, func(state *processCredentialState) { delete(state.groups, 200) }), want: "supplementary"},
+		{name: "retained extra group", state: withCredentialState(valid, func(state *processCredentialState) { state.groups[0] = struct{}{} }), want: "supplementary"},
+		{name: "effective capability", state: withCredentialState(valid, func(state *processCredentialState) { state.capEffective = 1 }), want: "capabilit"},
+		{name: "permitted capability", state: withCredentialState(valid, func(state *processCredentialState) { state.capPermitted = 1 }), want: "capabilit"},
+		{name: "inheritable capability", state: withCredentialState(valid, func(state *processCredentialState) { state.capInheritable = 1 }), want: "capabilit"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateRunIdentityState(identity, tt.state)
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("validateRunIdentityState() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), tt.want) {
+				t.Fatalf("validateRunIdentityState() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+
+	if err := validateRunIdentityState(
+		userIdentity{uid: 0, gid: 0, groups: map[uint32]struct{}{0: {}}},
+		processCredentialState{euid: 0, egid: 123, groups: map[uint32]struct{}{456: {}}, capEffective: 1},
+	); err != nil {
+		t.Fatalf("root run_as retained privileges error = %v", err)
+	}
+}
+
+const runIdentityHelperUserEnv = "EZDBBACKUP_TEST_RUN_IDENTITY_USER"
+
+// Root-only execution directly crosses a complete syscall credential boundary
+// and asks the child to validate its real UID/GID/group/capability state.
+func TestOSEnvironmentRootCredentialTransitionMatchesOrdinaryLogin(t *testing.T) {
+	requireLinux(t)
+	if os.Getenv(runIdentityHelperUserEnv) != "" {
+		return
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to exercise a real credential transition")
+	}
+	target := lookupDistinctNonRootUsers(t, 1)[0]
+	identity, err := lookupIdentity(target.Username)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := versionProbeCredential(identity, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp("/tmp", "ezdbbackup-identity-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	if err := os.Chmod(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	currentBinary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryBytes, err := os.ReadFile(currentBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperBinary := filepath.Join(directory, "identity-helper")
+	if err := os.WriteFile(helperBinary, binaryBytes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	clear(binaryBytes)
+	command := exec.Command(helperBinary, "-test.run=^TestOSEnvironmentRunIdentityCredentialHelper$")
+	command.Env = append(os.Environ(), runIdentityHelperUserEnv+"="+target.Username)
+	command.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("credential helper error = %v, output = %s", err, output)
+	}
+}
+
+func TestOSEnvironmentRunIdentityCredentialHelper(t *testing.T) {
+	name := os.Getenv(runIdentityHelperUserEnv)
+	if name == "" {
+		return
+	}
+	if err := (OSEnvironment{}).CheckRunIdentity(name); err != nil {
+		t.Fatalf("CheckRunIdentity(%q) after credential transition error = %v", name, err)
+	}
+}
+
+func withCredentialState(state processCredentialState, mutate func(*processCredentialState)) processCredentialState {
+	cloned := state
+	cloned.groups = make(map[uint32]struct{}, len(state.groups))
+	for group := range state.groups {
+		cloned.groups[group] = struct{}{}
+	}
+	mutate(&cloned)
+	return cloned
 }
 
 func requireLinux(t *testing.T) {

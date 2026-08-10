@@ -4,28 +4,65 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 
+	"github.com/ezgamehost/ezdbbackup/internal/securepath"
 	"gopkg.in/yaml.v3"
 )
 
+// MaxFileBytes bounds configuration parsing to one MiB. Configuration is
+// control data, not a bulk-data channel; this leaves generous room for many
+// jobs while bounding startup memory and read work.
+const MaxFileBytes int64 = 1 << 20
+
 // Load reads and decodes a configuration file.
 func Load(path string) (*Config, Findings) {
-	f, err := os.Open(path)
+	identity, err := securepath.CurrentIdentity()
 	if err != nil {
 		return nil, Findings{{Path: path, Message: err.Error()}}
 	}
-	defer f.Close()
-	return Decode(f)
+	file, source, err := securepath.OpenRegular(path, securepath.Policy{
+		Label:                  "configuration file",
+		Identity:               identity,
+		Access:                 securepath.AccessRead,
+		MaxBytes:               MaxFileBytes,
+		RequireSingleLink:      true,
+		RejectOtherPermissions: true,
+	})
+	if err != nil {
+		return nil, Findings{{Path: path, Message: err.Error()}}
+	}
+	data, readErr := securepath.ReadAll(file, source, MaxFileBytes)
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, Findings{{Path: path, Message: fmt.Sprintf("read configuration: %v", readErr)}}
+	}
+	if closeErr != nil {
+		clear(data)
+		return nil, Findings{{Path: path, Message: fmt.Sprintf("close configuration: %v", closeErr)}}
+	}
+	cfg, findings := decodeBytes(data)
+	clear(data)
+	if cfg != nil {
+		cfg.source = &source
+	}
+	return cfg, findings
 }
 
 // Decode strictly decodes exactly one YAML configuration document.
 func Decode(r io.Reader) (*Config, Findings) {
-	b, err := io.ReadAll(r)
+	b, err := io.ReadAll(io.LimitReader(r, MaxFileBytes+1))
 	if err != nil {
 		return nil, Findings{{Message: fmt.Sprintf("read configuration: %v", err)}}
 	}
+	defer clear(b)
+	if int64(len(b)) > MaxFileBytes {
+		return nil, Findings{{Message: fmt.Sprintf("read configuration: configuration file is too large; maximum is %d bytes", MaxFileBytes)}}
+	}
+	return decodeBytes(b)
+}
+
+func decodeBytes(b []byte) (*Config, Findings) {
 	if err := validateStrictYAML(b); err != nil {
 		return nil, Findings{{Message: fmt.Sprintf("decode configuration: %v", err)}}
 	}

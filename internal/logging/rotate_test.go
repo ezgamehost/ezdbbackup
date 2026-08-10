@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -254,6 +255,95 @@ func TestAppendLineRollsBackPartialWrite(t *testing.T) {
 	lines := readLogLines(t, path)
 	if len(lines) != 2 || lines[0]["message"] != "before" || lines[1]["message"] != "after" {
 		t.Fatalf("lines after recovery = %#v", lines)
+	}
+}
+
+// With max_files=3 the documented directory work budget is 256+4*3 = 268
+// entries. The boundary must remain usable for sparse rotation and retention.
+func TestRotationEnumerationBudgetAllowsBoundaryAndSparseHistory(t *testing.T) {
+	const entryBudget = 268
+	directoryPath := secureLogDir(t)
+	writeLogFixture(t, filepath.Join(directoryPath, "info.log"), strings.Repeat("a", 64), 0o640)
+	writeLogFixture(t, filepath.Join(directoryPath, "info.log.1"), "one", 0o640)
+	writeLogFixture(t, filepath.Join(directoryPath, "info.log.3"), "three", 0o640)
+	for index := 0; index < entryBudget-3; index++ {
+		name := filepath.Join(directoryPath, fmt.Sprintf("unrelated-%03d", index))
+		if err := os.WriteFile(name, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	directory, err := ensureLogDirectory(directoryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.close()
+	logger := &FileLogger{}
+	if err := rotateIfNeeded(directory, "info.log", RotationOptions{
+		MaxSizeBytes: 32,
+		MaxFiles:     3,
+		MaxAge:       24 * time.Hour,
+	}, time.Now(), logger); err != nil {
+		t.Fatalf("rotateIfNeeded(at budget) error = %v", err)
+	}
+	assertRawLogContents(t, filepath.Join(directoryPath, "info.log.1"), strings.Repeat("a", 64))
+	assertRawLogContents(t, filepath.Join(directoryPath, "info.log.2"), "one")
+	if _, err := os.Lstat(filepath.Join(directoryPath, "info.log.3")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old suffix 3 still exists: %v", err)
+	}
+}
+
+// Exceeding the preflight budget must fail before any suffix is shifted or
+// removed, even when active size and retention would otherwise mutate files.
+func TestRotationEnumerationBudgetFailsWithoutPartialMutation(t *testing.T) {
+	const entryBudget = 268
+	directoryPath := secureLogDir(t)
+	activePath := filepath.Join(directoryPath, "info.log")
+	firstPath := filepath.Join(directoryPath, "info.log.1")
+	thirdPath := filepath.Join(directoryPath, "info.log.3")
+	writeLogFixture(t, activePath, strings.Repeat("a", 64), 0o640)
+	writeLogFixture(t, firstPath, "one", 0o640)
+	writeLogFixture(t, thirdPath, "three", 0o640)
+	for index := 0; index < entryBudget-2; index++ { // 269 total entries.
+		name := filepath.Join(directoryPath, fmt.Sprintf("unrelated-%03d", index))
+		if err := os.WriteFile(name, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	directory, err := ensureLogDirectory(directoryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.close()
+	logger := &FileLogger{}
+	err = rotateIfNeeded(directory, "info.log", RotationOptions{
+		MaxSizeBytes: 32,
+		MaxFiles:     3,
+		MaxAge:       time.Nanosecond,
+	}, time.Now().Add(time.Hour), logger)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "budget") {
+		t.Fatalf("rotateIfNeeded(over budget) error = %v, want preflight budget rejection", err)
+	}
+	if mutations := logger.rotationMutationCount.Load(); mutations != 0 {
+		t.Fatalf("rotation mutations = %d, want zero", mutations)
+	}
+	assertRawLogContents(t, activePath, strings.Repeat("a", 64))
+	assertRawLogContents(t, firstPath, "one")
+	assertRawLogContents(t, thirdPath, "three")
+	if _, err := os.Lstat(filepath.Join(directoryPath, "info.log.2")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial shifted suffix exists: %v", err)
+	}
+}
+
+func assertRawLogContents(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("%s contents = %q, want %q", path, got, want)
 	}
 }
 

@@ -4,13 +4,147 @@ import (
 	"errors"
 	"math"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+const distinctUserRotationHelperEnv = "EZDBBACKUP_TEST_SHARED_LOG_DIRECTORY"
+
+// On root-capable hosts this proves the accepted non-sticky setgid policy can
+// rotate a root-owned active log from a distinct non-root run_as process.
+func TestDistinctUserCanRotateRootOwnedLogInNonStickySharedDirectory(t *testing.T) {
+	if os.Getenv(distinctUserRotationHelperEnv) != "" {
+		return
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to exercise distinct-user rotation")
+	}
+	target := lookupLoggingTestUser(t)
+	targetGID, err := strconv.Atoi(target.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp("/tmp", "ezdbbackup-shared-log-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	if err := os.Chown(directory, 0, targetGID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, os.ModeSetgid|0o770); err != nil {
+		t.Fatal(err)
+	}
+	logger, err := New(Options{Directory: directory, Rotation: RotationOptions{MaxSizeBytes: 1, MaxFiles: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logger.Write(Event{Time: time.Now(), Level: InfoLevel, Message: "root entry", Command: "backup"}); err != nil {
+		t.Fatal(err)
+	}
+
+	helperBinary := copyLoggingTestBinary(t)
+	command := exec.Command(helperBinary, "-test.run=^TestDistinctUserRotationCredentialHelper$")
+	command.Env = append(os.Environ(), distinctUserRotationHelperEnv+"="+directory)
+	command.SysProcAttr = &syscall.SysProcAttr{Credential: loggingTestCredential(t, target)}
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("distinct-user logging helper error = %v, output = %s", err, output)
+	}
+	rotation := filepath.Join(directory, "info.log.1")
+	stat, err := os.Stat(rotation)
+	if err != nil {
+		t.Fatalf("rotated root log stat error = %v", err)
+	}
+	owner, ok := stat.Sys().(*syscall.Stat_t)
+	if !ok || owner.Uid != 0 {
+		t.Fatalf("rotation owner = %#v, want original root-owned identity", stat.Sys())
+	}
+}
+
+func TestDistinctUserRotationCredentialHelper(t *testing.T) {
+	directory := os.Getenv(distinctUserRotationHelperEnv)
+	if directory == "" {
+		return
+	}
+	logger, err := New(Options{Directory: directory, Rotation: RotationOptions{MaxSizeBytes: 1, MaxFiles: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logger.Write(Event{Time: time.Now(), Level: InfoLevel, Message: "non-root entry", Command: "backup"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func lookupLoggingTestUser(t *testing.T) *user.User {
+	t.Helper()
+	for _, name := range []string{"nobody", "daemon", "www-data"} {
+		account, err := user.Lookup(name)
+		if err == nil && account.Uid != "0" {
+			return account
+		}
+	}
+	t.Skip("no non-root local user available")
+	return nil
+}
+
+func loggingTestCredential(t *testing.T, account *user.User) *syscall.Credential {
+	t.Helper()
+	uid, err := strconv.ParseUint(account.Uid, 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid, err := strconv.ParseUint(account.Gid, 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupIDs, err := account.GroupIds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := make([]uint32, 0, len(groupIDs))
+	for _, value := range groupIDs {
+		group, parseErr := strconv.ParseUint(value, 10, 32)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		groups = append(groups, uint32(group))
+	}
+	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: groups}
+}
+
+func copyLoggingTestBinary(t *testing.T) string {
+	t.Helper()
+	current, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp("/tmp", "ezdbbackup-logging-helper-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	if err := os.Chmod(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "helper")
+	if err := os.WriteFile(path, contents, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	clear(contents)
+	return path
+}
 
 func TestNewRejectsHugeRotationHistoryBeforeFilesystemMutation(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "logs")
@@ -125,6 +259,22 @@ func TestNewRejectsUnsafeLogDirectoryModes(t *testing.T) {
 				t.Fatalf("New() error = %v, want unsafe-directory rejection", err)
 			}
 		})
+	}
+}
+
+// Sticky semantics let a group member append but prevent it from renaming or
+// unlinking rotations owned by another run_as identity.
+func TestNewRejectsStickySharedLogDirectoryBeforeCreatingFiles(t *testing.T) {
+	directory := secureLogDir(t)
+	if err := os.Chmod(directory, os.ModeSetgid|os.ModeSticky|0o770); err != nil {
+		t.Fatal(err)
+	}
+	_, err := New(Options{Directory: directory, Rotation: RotationOptions{MaxFiles: 7}})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "sticky") {
+		t.Fatalf("New(sticky shared directory) error = %v, want sticky-policy rejection", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(directory, "info.log")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("New(sticky shared directory) created info.log: %v", statErr)
 	}
 }
 
@@ -536,6 +686,157 @@ func TestConfiguredDirectorySymlinkIsBoundToOriginalTarget(t *testing.T) {
 	data, readErr := os.ReadFile(filepath.Join(second, "info.log"))
 	if !errors.Is(readErr, os.ErrNotExist) || len(data) != 0 {
 		t.Fatalf("replacement directory received log data %q, error %v", data, readErr)
+	}
+}
+
+func TestDirectoryBindingRejectsSwapBeforeLoggerInitialization(t *testing.T) {
+	root := secureLogDir(t)
+	first := filepath.Join(root, "first")
+	second := filepath.Join(root, "second")
+	for _, path := range []string{first, second} {
+		if err := os.Mkdir(path, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(root, "current")
+	if err := os.Symlink(first, link); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := BindDirectory(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(second, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := New(Options{Directory: link, Binding: binding}); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("New(swapped bound directory) error = %v, want identity rejection", err)
+	}
+	if entries, err := os.ReadDir(second); err != nil || len(entries) != 0 {
+		t.Fatalf("replacement directory entries = %#v, error = %v; want no logger mutation", entries, err)
+	}
+}
+
+func TestBindDirectoryRejectsUnrelatedStickySymlink(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to construct an unrelated symlink owner")
+	}
+	attacker := lookupLoggingTestUser(t)
+	attackerUID, err := strconv.Atoi(attacker.Uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attackerGID, err := strconv.Atoi(attacker.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp("/tmp", "ezdbbackup-log-link-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	if err := os.Chmod(root, os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "trusted")
+	if err := os.Mkdir(target, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "logs")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Lchown(link, attackerUID, attackerGID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BindDirectory(link); err == nil || !strings.Contains(err.Error(), "unrelated owner") {
+		t.Fatalf("BindDirectory(attacker symlink) error = %v", err)
+	}
+}
+
+func TestMissingDirectoryRejectsUnrelatedStickySymlinkBeforeMutation(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to construct an unrelated symlink owner")
+	}
+	attacker := lookupLoggingTestUser(t)
+	attackerUID, err := strconv.Atoi(attacker.Uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attackerGID, err := strconv.Atoi(attacker.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp("/tmp", "ezdbbackup-missing-log-link-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	if err := os.Chmod(root, os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "trusted")
+	if err := os.Mkdir(target, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "redirect")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Lchown(link, attackerUID, attackerGID); err != nil {
+		t.Fatal(err)
+	}
+	configured := filepath.Join(link, "must-not-be-created")
+	if _, err := New(Options{Directory: configured}); err == nil || !strings.Contains(err.Error(), "unrelated owner") {
+		t.Fatalf("New(attacker redirect to missing directory) error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(target, "must-not-be-created")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("redirect target mutation stat error = %v, want no created directory", err)
+	}
+}
+
+func TestMissingDirectorySymlinkRemovalCannotRedirectCreation(t *testing.T) {
+	root := secureLogDir(t)
+	target := filepath.Join(root, "selected-target")
+	if err := os.Mkdir(target, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	redirect := filepath.Join(root, "redirect")
+	if err := os.Symlink(target, redirect); err != nil {
+		t.Fatal(err)
+	}
+	configured := filepath.Join(redirect, "new-logs")
+	removed := false
+	directory, err := createMissingLogDirectoryWithHook(configured, func(component string) {
+		if component != "redirect" || removed {
+			return
+		}
+		removed = true
+		if err := os.Remove(redirect); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err != nil {
+		t.Fatalf("createMissingLogDirectoryWithHook() error = %v", err)
+	}
+	if err := directory.close(); err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("symlink-removal hook did not run")
+	}
+	if _, err := os.Lstat(filepath.Join(target, "new-logs")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("previously selected target mutation stat error = %v, want no created directory", err)
+	}
+	if info, err := os.Stat(configured); err != nil || !info.IsDir() {
+		t.Fatalf("lexical configured directory stat = %#v, error = %v", info, err)
 	}
 }
 

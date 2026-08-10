@@ -122,6 +122,36 @@ func TestValidatorBackupExecutionRequiresExactRunAsIdentity(t *testing.T) {
 	if !slicesContains(env.calls, "run-identity:alpha-user") {
 		t.Fatalf("environment calls = %#v, want run identity check", env.calls)
 	}
+	for _, call := range env.calls {
+		if strings.HasPrefix(call, "runtime-executable:") || strings.HasPrefix(call, "executable:") {
+			t.Fatalf("environment calls = %#v, must not execute configured binaries after identity mismatch", env.calls)
+		}
+	}
+}
+
+// Backup execution is all-or-nothing: no configured program may run until
+// every selected job has proven compatible with the process credential state.
+func TestValidatorPreflightsEverySelectedExecutionIdentityBeforeAnyExecutable(t *testing.T) {
+	cfg := validValidationConfig()
+	cfg.Jobs["alpha"] = validValidationJob("alpha", true)
+	cfg.Jobs["zulu"] = validValidationJob("zulu", true)
+	env := &fakeEnvironment{errors: map[string]error{
+		"run-identity:zulu-user": errors.New("effective user differs"),
+	}}
+
+	report := newValidator(env, &fakeRemoteDependencies{}).Check(context.Background(), cfg, []string{"alpha", "zulu"}, Options{
+		BinaryPath:      "/bin/ezdbbackup",
+		ConfigPath:      "/etc/config.yml",
+		BackupExecution: true,
+	})
+	if !hasFinding(report, "zulu", "execution_identity", "configured run_as") {
+		t.Fatalf("findings = %#v, want zulu execution-identity finding", report.Findings)
+	}
+	for _, call := range env.calls {
+		if strings.HasPrefix(call, "runtime-executable:") || strings.HasPrefix(call, "executable:") {
+			t.Fatalf("environment calls = %#v, configured executable ran before all selected identities passed", env.calls)
+		}
+	}
 }
 
 func slicesContains(values []string, want string) bool {

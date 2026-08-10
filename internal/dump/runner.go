@@ -11,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/ezgamehost/ezdbbackup/internal/securepath"
 )
 
 const defaultStderrLimit int64 = 64 << 10
@@ -44,7 +46,8 @@ func (e *RunError) Unwrap() error { return e.Err }
 // ExecRunner invokes mysqldump as a child process. StderrLimit controls the
 // maximum stderr included in a command failure; zero selects 64 KiB.
 type ExecRunner struct {
-	StderrLimit int64
+	StderrLimit         int64
+	afterExecutableOpen func(*os.File)
 }
 
 // Run writes the mysqldump output to dst.
@@ -58,10 +61,41 @@ func (r ExecRunner) Probe(ctx context.Context, req Request) error {
 	return r.run(ctx, req, ProbeArgs(req), io.Discard)
 }
 
-func (r ExecRunner) run(ctx context.Context, req Request, args []string, dst io.Writer) error {
+func (r ExecRunner) run(ctx context.Context, req Request, args []string, dst io.Writer) (returnErr error) {
 	stderr := newRedactingCappedBuffer(r.stderrLimit(), req.Password)
 	stdout := &errorRecordingWriter{dst: dst}
+	identity, err := executableIdentity(req.RunAs)
+	if err != nil {
+		return &RunError{Kind: FailureStartup, Err: err}
+	}
+	executable, source, err := securepath.OpenRegular(req.Binary, securepath.Policy{
+		Label:    "dump executable",
+		Identity: identity,
+		Access:   securepath.AccessExecute,
+		PathOnly: true,
+	})
+	if err != nil {
+		return &RunError{Kind: FailureStartup, Err: err}
+	}
+	defer func() {
+		if closeErr := executable.Close(); closeErr != nil {
+			closeFailure := &RunError{Kind: FailureExecution, Err: fmt.Errorf("close dump executable descriptor: %w", closeErr)}
+			returnErr = errors.Join(returnErr, closeFailure)
+		}
+	}()
+	if r.afterExecutableOpen != nil {
+		r.afterExecutableOpen(executable)
+	}
+	if err := securepath.RecheckPath(source); err != nil {
+		return &RunError{Kind: FailureStartup, Err: fmt.Errorf("recheck dump executable path: %w", err)}
+	}
+
+	// The lexical path, every symlink entry, canonical ancestors, and final
+	// regular identity were just pinned and rechecked as non-replaceable by an
+	// unrelated user. Executing the requested path preserves normal shebang
+	// argv[0] semantics; the descriptor remains open until the child finishes.
 	cmd := exec.CommandContext(ctx, req.Binary, args...)
+	cmd.Args[0] = req.Binary
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Env = childEnv(req.Password)
@@ -72,7 +106,7 @@ func (r ExecRunner) run(ctx context.Context, req Request, args []string, dst io.
 		stderr.finish()
 		return &RunError{Kind: FailureStartup, Err: fmt.Errorf("%w: %s", err, stderr.String())}
 	}
-	err := cmd.Wait()
+	err = cmd.Wait()
 	if copyErr := stdout.Err(); copyErr != nil && !errors.Is(err, copyErr) {
 		err = errors.Join(err, copyErr)
 	}
@@ -88,6 +122,13 @@ func (r ExecRunner) run(ctx context.Context, req Request, args []string, dst io.
 		return &RunError{Kind: FailureExecution, Err: fmt.Errorf("%w: %s", cause, stderr.String())}
 	}
 	return nil
+}
+
+func executableIdentity(runAs string) (securepath.Identity, error) {
+	if runAs == "" {
+		return securepath.CurrentIdentity()
+	}
+	return securepath.LookupIdentity(runAs)
 }
 
 type errorRecordingWriter struct {

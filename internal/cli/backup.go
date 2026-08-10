@@ -2,9 +2,12 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 
 	"github.com/ezgamehost/ezdbbackup/internal/backup"
 	"github.com/ezgamehost/ezdbbackup/internal/config"
@@ -42,6 +45,7 @@ func runBackup(ctx context.Context, args []string, deps Dependencies) int {
 	if printConfigFindings(findings, deps) {
 		return 2
 	}
+	trustedConfig := cfg.TrustedPath(effectiveConfig)
 
 	var selected []string
 	if *all {
@@ -75,9 +79,13 @@ func runBackup(ctx context.Context, args []string, deps Dependencies) int {
 	report := deps.Validator.Check(ctx, cfg, selected, validation.Options{
 		BackupExecution: true,
 		BinaryPath:      binaryPath,
-		ConfigPath:      effectiveConfig,
+		ConfigPath:      trustedConfig,
 	})
 	if printValidationReport(report, deps) {
+		return 2
+	}
+	if err := cfg.RecheckSource(); err != nil {
+		fmt.Fprintf(deps.Stderr, "backup validation: loaded configuration source changed: %s\n", encoded(err))
 		return 2
 	}
 
@@ -125,7 +133,20 @@ func executablePath(deps Dependencies) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve executable path: %w", err)
 	}
-	return effectiveAbsolutePath(path)
+	absolute, err := effectiveAbsolutePath(path)
+	if err != nil {
+		return "", err
+	}
+	canonical, err := filepath.EvalSymlinks(absolute)
+	if err == nil {
+		return filepath.Clean(canonical), nil
+	}
+	// Unit-injected paths may intentionally be absent; production os.Executable
+	// always names the running image and therefore takes the canonical branch.
+	if errors.Is(err, os.ErrNotExist) {
+		return absolute, nil
+	}
+	return "", fmt.Errorf("resolve canonical executable path: %w", err)
 }
 
 func printConfigFindings(findings config.Findings, deps Dependencies) bool {

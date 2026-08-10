@@ -1,9 +1,131 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// Removing the bounded reader from Load or Decode would let a local config
+// source consume memory without limit before YAML validation begins.
+func TestConfigurationReadsAreBounded(t *testing.T) {
+	oversized := strings.Repeat("#", int(MaxFileBytes)+1)
+	if _, findings := Decode(strings.NewReader(oversized)); !findings.HasErrors() || !strings.Contains(findings.Error(), "too large") {
+		t.Fatalf("Decode(oversized) findings = %v, want size rejection", findings)
+	}
+
+	path := filepath.Join(secureConfigTestDir(t), "config.yml")
+	if err := os.WriteFile(path, []byte(oversized), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, findings := Load(path); !findings.HasErrors() || !strings.Contains(findings.Error(), "too large") {
+		t.Fatalf("Load(oversized) findings = %v, want size rejection", findings)
+	}
+}
+
+// Reopening the configured pathname after decoding would lose this canonical
+// identity and reintroduce a validation-to-use substitution window.
+func TestLoadRecordsAndRechecksPinnedCanonicalSource(t *testing.T) {
+	directory := secureConfigTestDir(t)
+	target := filepath.Join(directory, "config-target.yml")
+	if err := os.WriteFile(target, []byte("version: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(directory, "config.yml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, findings := Load(link)
+	if findings.HasErrors() {
+		t.Fatalf("Load() findings = %v", findings)
+	}
+	source, ok := cfg.Source()
+	if !ok {
+		t.Fatal("Load() config has no pinned source metadata")
+	}
+	if source.CanonicalPath != target {
+		t.Fatalf("canonical source = %q, want %q", source.CanonicalPath, target)
+	}
+	if got := cfg.TrustedPath(link); got != target {
+		t.Fatalf("TrustedPath() = %q, want %q", got, target)
+	}
+
+	original := target + ".original"
+	if err := os.Rename(target, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("version: 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.RecheckSource(); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("RecheckSource() error = %v, want identity-change rejection", err)
+	}
+}
+
+// A source must not be mutable through its own metadata or a replaceable
+// canonical ancestor. A sticky shared boundary remains safe when the entry is
+// owned by the trusted loading identity.
+func TestLoadRejectsUnsafeSourceMetadataAndCanonicalAncestors(t *testing.T) {
+	t.Run("group writable file", func(t *testing.T) {
+		path := filepath.Join(secureConfigTestDir(t), "config.yml")
+		if err := os.WriteFile(path, []byte("version: 1\n"), 0o660); err != nil {
+			t.Fatal(err)
+		}
+		if _, findings := Load(path); !findings.HasErrors() || !strings.Contains(findings.Error(), "writable") {
+			t.Fatalf("Load(group-writable) findings = %v, want rejection", findings)
+		}
+	})
+
+	t.Run("non-sticky writable ancestor", func(t *testing.T) {
+		parent := filepath.Join(secureConfigTestDir(t), "shared")
+		if err := os.Mkdir(parent, 0o770); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(parent, 0o770); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(parent, "config.yml")
+		if err := os.WriteFile(path, []byte("version: 1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, findings := Load(path); !findings.HasErrors() || !strings.Contains(findings.Error(), "ancestor") {
+			t.Fatalf("Load(replaceable ancestor) findings = %v, want rejection", findings)
+		}
+	})
+
+	t.Run("sticky boundary and safe symlink", func(t *testing.T) {
+		root := secureConfigTestDir(t)
+		shared := filepath.Join(root, "shared")
+		if err := os.Mkdir(shared, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(shared, os.ModeSticky|0o777); err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(shared, "trusted.yml")
+		if err := os.WriteFile(target, []byte("version: 1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(root, "distro-config.yml")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, findings := Load(link); findings.HasErrors() {
+			t.Fatalf("Load(sticky safe symlink) findings = %v", findings)
+		}
+	})
+}
+
+func secureConfigTestDir(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return directory
+}
 
 func TestDecodeValidConfigAppliesDefaults(t *testing.T) {
 	input := `

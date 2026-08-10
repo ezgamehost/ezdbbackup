@@ -31,7 +31,7 @@ func New(options Options) (*FileLogger, error) {
 	if options.Rotation.MaxFiles > MaxRotationFiles {
 		return nil, fmt.Errorf("max_files must not exceed %d", MaxRotationFiles)
 	}
-	directory, err := ensureLogDirectory(options.Directory)
+	directory, err := ensureBoundLogDirectory(options.Directory, options.Binding)
 	if err != nil {
 		return nil, fmt.Errorf("initialize log directory: %w", err)
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/ezgamehost/ezdbbackup/internal/config"
 	"github.com/ezgamehost/ezdbbackup/internal/dump"
 	"github.com/ezgamehost/ezdbbackup/internal/jobresolve"
+	"github.com/ezgamehost/ezdbbackup/internal/securepath"
 	"github.com/ezgamehost/ezdbbackup/internal/storage"
 )
 
@@ -99,6 +100,28 @@ func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []str
 			logRunAs = append(logRunAs, runAs)
 		}
 	}
+	allExecutionIdentitiesOK := true
+	if options.BackupExecution {
+		// A backup invocation is one privilege boundary. Prove every selected
+		// job is compatible before executing even the first configured binary;
+		// otherwise backup --all could run one job's code before a later
+		// identity mismatch makes the invocation fail.
+		for _, name := range names {
+			job := cfg.Jobs[name]
+			if err := v.Environment.CheckRunIdentity(job.RunAs); err != nil {
+				report = appendCheck(report, name, "execution_identity", "backup process identity does not match configured run_as", err)
+				prerequisites[name].mysqlLocal = false
+				prerequisites[name].s3Local = false
+				allExecutionIdentitiesOK = false
+			}
+		}
+		if !allExecutionIdentitiesOK {
+			for _, name := range names {
+				prerequisites[name].mysqlLocal = false
+				prerequisites[name].s3Local = false
+			}
+		}
+	}
 
 	for _, name := range names {
 		job := cfg.Jobs[name]
@@ -109,28 +132,25 @@ func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []str
 			state.mysqlLocal = false
 			state.s3Local = false
 		}
-		if options.BackupExecution {
-			if err := v.Environment.CheckRunIdentity(job.RunAs); err != nil {
-				report = appendCheck(report, name, "execution_identity", "backup process identity does not match configured run_as", err)
-				state.mysqlLocal = false
-				state.s3Local = false
-			}
-		}
 		if job.Enabled {
-			if err := v.Environment.CheckRuntimeExecutable(ctx, options.BinaryPath, job.RunAs); err != nil {
-				report = appendCheck(report, name, "runtime_executable", "scheduled ezdbbackup executable is unavailable or unsafe", err)
-				state.mysqlLocal = false
-				state.s3Local = false
+			if allExecutionIdentitiesOK {
+				if err := v.Environment.CheckRuntimeExecutable(ctx, options.BinaryPath, job.RunAs); err != nil {
+					report = appendCheck(report, name, "runtime_executable", "scheduled ezdbbackup executable is unavailable or unsafe", err)
+					state.mysqlLocal = false
+					state.s3Local = false
+				}
 			}
-			if err := v.Environment.CheckConfigFile(options.ConfigPath, job.RunAs); err != nil {
+			if err := checkConfigurationSource(v.Environment, cfg, options.ConfigPath, job.RunAs); err != nil {
 				report = appendCheck(report, name, "configuration_file", "configuration file is unreadable or unsafe for scheduled execution", err)
 				state.mysqlLocal = false
 				state.s3Local = false
 			}
 		}
-		if err := checkExecutable(ctx, v.Environment, job.DumpBinary, job.RunAs); err != nil {
-			report = appendCheck(report, name, "dump_executable", "dump executable is unavailable", err)
-			state.mysqlLocal = false
+		if allExecutionIdentitiesOK {
+			if err := checkExecutable(ctx, v.Environment, job.DumpBinary, job.RunAs); err != nil {
+				report = appendCheck(report, name, "dump_executable", "dump executable is unavailable", err)
+				state.mysqlLocal = false
+			}
 		}
 		report = appendCheck(report, name, "temp_directory", "temporary directory is not writable or safe for staging", checkStagingTarget(v.Environment, job.TempDir, job.RunAs))
 
@@ -176,6 +196,19 @@ func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []str
 		}
 	}
 	return report
+}
+
+type configSourceEnvironment interface {
+	CheckConfigSource(securepath.Source, string) error
+}
+
+func checkConfigurationSource(environment Environment, cfg *config.Config, fallbackPath, runAs string) error {
+	if source, ok := cfg.Source(); ok {
+		if sourceEnvironment, supported := environment.(configSourceEnvironment); supported {
+			return sourceEnvironment.CheckConfigSource(source, runAs)
+		}
+	}
+	return environment.CheckConfigFile(fallbackPath, runAs)
 }
 
 func connectivityIdentityWarning(job, invokingUser, runAs string) Finding {

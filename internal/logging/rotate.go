@@ -24,50 +24,60 @@ type rotationFile struct {
 	snapshot   fileSnapshot
 }
 
+const (
+	// Directory enumeration uses fixed-size reads and admits enough entries for
+	// three full log families plus locks/temporaries and unrelated shared-group
+	// entries. The cap bounds both retained memory and per-write scan work.
+	rotationReadChunk      = 128
+	rotationEntryBase      = 256
+	rotationEntriesPerFile = 4
+	maxRotationEntryBudget = 8192
+)
+
 func rotateIfNeeded(directory *logDirectory, activeName string, options RotationOptions, now time.Time, logger *FileLogger) error {
 	if options.MaxFiles > MaxRotationFiles {
 		return fmt.Errorf("max_files must not exceed %d", MaxRotationFiles)
+	}
+	rotations, err := listRotations(directory, activeName, rotationEntryBudget(options.MaxFiles))
+	if err != nil {
+		return err
 	}
 	active, err := directory.statFile(activeName)
 	if err != nil {
 		return fmt.Errorf("stat active log: %w", err)
 	}
 	if options.MaxSizeBytes > 0 && active.size >= options.MaxSizeBytes {
-		if err := rotate(directory, activeName, active, options, logger); err != nil {
+		rotations, err = rotate(directory, activeName, active, rotations, options, logger)
+		if err != nil {
 			return err
 		}
 	}
-	if err := enforceRetention(directory, activeName, options, now, logger); err != nil {
+	if err := enforceRetention(directory, rotations, options, now, logger); err != nil {
 		return err
 	}
 	return nil
 }
 
-func rotate(directory *logDirectory, activeName string, active fileSnapshot, options RotationOptions, logger *FileLogger) error {
+func rotate(directory *logDirectory, activeName string, active fileSnapshot, rotations []rotationFile, options RotationOptions, logger *FileLogger) ([]rotationFile, error) {
 	if options.MaxFiles <= 0 {
 		file, opened, err := directory.openFile(activeName, unix.O_WRONLY, false)
 		if err != nil {
-			return fmt.Errorf("open active log for reset: %w", err)
+			return nil, fmt.Errorf("open active log for reset: %w", err)
 		}
 		defer file.Close()
 		if opened.identity != active.identity {
-			return errors.New("active log changed before reset")
+			return nil, errors.New("active log changed before reset")
 		}
 		if logger.beforeMutation != nil {
 			logger.beforeMutation("truncate_recheck", activeName)
 		}
 		if err := directory.verifyFile(activeName, active); err != nil {
-			return fmt.Errorf("active log changed before reset: %w", err)
+			return nil, fmt.Errorf("active log changed before reset: %w", err)
 		}
 		if err := file.Truncate(0); err != nil {
-			return fmt.Errorf("reset active log: %w", err)
+			return nil, fmt.Errorf("reset active log: %w", err)
 		}
-		return nil
-	}
-
-	rotations, err := listRotations(directory, activeName)
-	if err != nil {
-		return err
+		return rotations, nil
 	}
 	sort.Slice(rotations, func(i, j int) bool {
 		if rotations[i].suffix != rotations[j].suffix {
@@ -75,10 +85,11 @@ func rotate(directory *logDirectory, activeName string, active fileSnapshot, opt
 		}
 		return rotations[i].name > rotations[j].name
 	})
+	shifted := make([]rotationFile, 0, len(rotations)+1)
 	for _, existing := range rotations {
 		if existing.suffix >= options.MaxFiles {
 			if err := safeUnlinkAt(directory, existing.name, existing.snapshot, logger); err != nil {
-				return fmt.Errorf("prune oldest rotated log: %w", err)
+				return nil, fmt.Errorf("prune oldest rotated log: %w", err)
 			}
 			continue
 		}
@@ -88,27 +99,46 @@ func rotate(directory *logDirectory, activeName string, active fileSnapshot, opt
 		}
 		destination := rotatedName(activeName, existing.suffix+1) + extension
 		if err := safeRenameAt(directory, existing.name, destination, existing.snapshot, logger); err != nil {
-			return fmt.Errorf("shift rotated log: %w", err)
+			return nil, fmt.Errorf("shift rotated log: %w", err)
 		}
+		existing.name = destination
+		existing.suffix++
+		shifted = append(shifted, existing)
 	}
 
 	first := rotatedName(activeName, 1)
 	if err := safeRenameAt(directory, activeName, first, active, logger); err != nil {
-		return fmt.Errorf("rotate active log: %w", err)
+		return nil, fmt.Errorf("rotate active log: %w", err)
 	}
+	firstRotation := rotationFile{name: first, suffix: 1, snapshot: active}
 	if options.Compress {
 		rotated, err := directory.statFile(first)
 		if err != nil {
-			return fmt.Errorf("inspect first rotation: %w", err)
+			return nil, fmt.Errorf("inspect first rotation: %w", err)
 		}
-		if err := compressFileAt(directory, first, rotated, logger); err != nil {
-			return fmt.Errorf("compress rotated log: %w", err)
+		compressed, err := compressFileAt(directory, first, rotated, logger)
+		if err != nil {
+			return nil, fmt.Errorf("compress rotated log: %w", err)
 		}
+		firstRotation.name += ".gz"
+		firstRotation.compressed = true
+		firstRotation.snapshot = compressed
 	}
-	return nil
+	return append(shifted, firstRotation), nil
 }
 
-func listRotations(directory *logDirectory, activeName string) ([]rotationFile, error) {
+func rotationEntryBudget(maxFiles int) int {
+	if maxFiles < 0 {
+		maxFiles = 0
+	}
+	budget := rotationEntryBase + rotationEntriesPerFile*maxFiles
+	if budget > maxRotationEntryBudget {
+		return maxRotationEntryBudget
+	}
+	return budget
+}
+
+func listRotations(directory *logDirectory, activeName string, entryBudget int) ([]rotationFile, error) {
 	fd, err := unix.Openat(directory.fd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open log directory for enumeration: %w", err)
@@ -118,31 +148,42 @@ func listRotations(directory *logDirectory, activeName string) ([]rotationFile, 
 		_ = unix.Close(fd)
 		return nil, errors.New("create log directory enumeration descriptor")
 	}
-	entries, readErr := file.ReadDir(-1)
-	closeErr := file.Close()
-	if readErr != nil {
-		return nil, fmt.Errorf("read log directory: %w", readErr)
-	}
-	if closeErr != nil {
-		return nil, fmt.Errorf("close log directory enumeration: %w", closeErr)
-	}
-
 	rotations := make([]rotationFile, 0)
-	for _, entry := range entries {
-		suffix, compressed, ok := rotationSuffix(entry.Name(), activeName+".")
-		if !ok {
-			continue
+	seen := 0
+	for {
+		entries, readErr := file.ReadDir(rotationReadChunk)
+		for _, entry := range entries {
+			seen++
+			if seen > entryBudget {
+				_ = file.Close()
+				return nil, fmt.Errorf("log directory enumeration budget of %d entries exceeded", entryBudget)
+			}
+			suffix, compressed, ok := rotationSuffix(entry.Name(), activeName+".")
+			if !ok {
+				continue
+			}
+			snapshot, err := directory.statFile(entry.Name())
+			if err != nil {
+				_ = file.Close()
+				return nil, fmt.Errorf("inspect rotated log %q: %w", entry.Name(), err)
+			}
+			rotations = append(rotations, rotationFile{
+				name:       entry.Name(),
+				suffix:     suffix,
+				compressed: compressed,
+				snapshot:   snapshot,
+			})
 		}
-		snapshot, err := directory.statFile(entry.Name())
-		if err != nil {
-			return nil, fmt.Errorf("inspect rotated log %q: %w", entry.Name(), err)
+		if errors.Is(readErr, io.EOF) {
+			break
 		}
-		rotations = append(rotations, rotationFile{
-			name:       entry.Name(),
-			suffix:     suffix,
-			compressed: compressed,
-			snapshot:   snapshot,
-		})
+		if readErr != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("read log directory: %w", readErr)
+		}
+	}
+	if closeErr := file.Close(); closeErr != nil {
+		return nil, fmt.Errorf("close log directory enumeration: %w", closeErr)
 	}
 	return rotations, nil
 }
@@ -291,19 +332,19 @@ func snapshotMatchesStat(expected fileSnapshot, stat unix.Stat_t) bool {
 	return current.identity == expected.identity && current.links == expected.links && current.mode == expected.mode && current.uid == expected.uid && current.gid == expected.gid
 }
 
-func compressFileAt(directory *logDirectory, sourceName string, sourceSnapshot fileSnapshot, logger *FileLogger) (returnErr error) {
+func compressFileAt(directory *logDirectory, sourceName string, sourceSnapshot fileSnapshot, logger *FileLogger) (result fileSnapshot, returnErr error) {
 	source, openedSource, err := directory.openFile(sourceName, unix.O_RDONLY, false)
 	if err != nil {
-		return err
+		return fileSnapshot{}, err
 	}
 	defer source.Close()
 	if openedSource.identity != sourceSnapshot.identity {
-		return errors.New("rotation source changed before compression")
+		return fileSnapshot{}, errors.New("rotation source changed before compression")
 	}
 
 	temporaryName, temporary, temporarySnapshot, err := createGzipTemporary(directory, sourceName, logger)
 	if err != nil {
-		return err
+		return fileSnapshot{}, err
 	}
 	temporaryOpen := true
 	published := false
@@ -321,30 +362,34 @@ func compressFileAt(directory *logDirectory, sourceName string, sourceSnapshot f
 	compressed := gzip.NewWriter(temporary)
 	if _, err := io.Copy(compressed, source); err != nil {
 		_ = compressed.Close()
-		return err
+		return fileSnapshot{}, err
 	}
 	if err := compressed.Close(); err != nil {
-		return err
+		return fileSnapshot{}, err
 	}
 	if err := temporary.Sync(); err != nil {
-		return err
+		return fileSnapshot{}, err
 	}
 	if err := temporary.Close(); err != nil {
 		temporaryOpen = false
-		return err
+		return fileSnapshot{}, err
 	}
 	temporaryOpen = false
 	if err := directory.verifyFile(sourceName, sourceSnapshot); err != nil {
-		return fmt.Errorf("rotation source changed during compression: %w", err)
+		return fileSnapshot{}, fmt.Errorf("rotation source changed during compression: %w", err)
 	}
 	if err := safeRenameAt(directory, temporaryName, sourceName+".gz", temporarySnapshot, logger); err != nil {
-		return err
+		return fileSnapshot{}, err
 	}
 	published = true
-	if err := safeUnlinkAt(directory, sourceName, sourceSnapshot, logger); err != nil {
-		return err
+	result, err = directory.statFile(sourceName + ".gz")
+	if err != nil {
+		return fileSnapshot{}, err
 	}
-	return nil
+	if err := safeUnlinkAt(directory, sourceName, sourceSnapshot, logger); err != nil {
+		return fileSnapshot{}, err
+	}
+	return result, nil
 }
 
 func createGzipTemporary(directory *logDirectory, sourceName string, logger *FileLogger) (string, *os.File, fileSnapshot, error) {
@@ -370,11 +415,7 @@ func createGzipTemporary(directory *logDirectory, sourceName string, logger *Fil
 	return "", nil, fileSnapshot{}, errors.New("create unique gzip temporary")
 }
 
-func enforceRetention(directory *logDirectory, activeName string, options RotationOptions, now time.Time, logger *FileLogger) error {
-	rotations, err := listRotations(directory, activeName)
-	if err != nil {
-		return fmt.Errorf("enumerate rotated logs for retention: %w", err)
-	}
+func enforceRetention(directory *logDirectory, rotations []rotationFile, options RotationOptions, now time.Time, logger *FileLogger) error {
 	retained := make([]rotationFile, 0, len(rotations))
 	for _, rotation := range rotations {
 		remove := options.MaxFiles <= 0 || rotation.suffix > options.MaxFiles

@@ -76,6 +76,7 @@ func runCronInstall(ctx context.Context, args []string, deps Dependencies) int {
 	if printConfigFindings(findings, deps) {
 		return 2
 	}
+	trustedConfig := cfg.TrustedPath(effectiveConfig)
 	binaryPath, err := executablePath(deps)
 	if err != nil {
 		fmt.Fprintf(deps.Stderr, "cron install validation: %s\n", encoded(err))
@@ -83,12 +84,16 @@ func runCronInstall(ctx context.Context, args []string, deps Dependencies) int {
 	}
 	report := deps.Validator.Check(ctx, cfg, nil, validation.Options{
 		BinaryPath: binaryPath,
-		ConfigPath: effectiveConfig,
+		ConfigPath: trustedConfig,
 	})
 	if printValidationReport(report, deps) {
 		return 2
 	}
-	content, err := cronpkg.Render(cfg, binaryPath, effectiveConfig)
+	if err := cfg.RecheckSource(); err != nil {
+		fmt.Fprintf(deps.Stderr, "cron install validation: loaded configuration source changed: %s\n", encoded(err))
+		return 2
+	}
+	content, err := cronpkg.Render(cfg, binaryPath, trustedConfig)
 	if err != nil {
 		fmt.Fprintf(deps.Stderr, "cron install: render schedule: %s\n", encoded(err))
 		return 2

@@ -5,6 +5,11 @@ import (
 	"strings"
 )
 
+// MaxSecretFileBytes bounds each file-backed credential to 64 KiB. Database
+// passwords and S3 credential fields are small control values; larger files
+// indicate a configuration mistake or hostile input.
+const MaxSecretFileBytes = 64 << 10
+
 // SecretRef is a secret supplied literally or from a file.
 type SecretRef struct {
 	Literal string
@@ -22,6 +27,7 @@ func (s SecretRef) Resolve(readFile func(string) ([]byte, error)) (string, error
 	if err != nil {
 		return "", err
 	}
+	defer clear(b)
 	return strings.TrimRight(string(b), "\r\n"), nil
 }
 

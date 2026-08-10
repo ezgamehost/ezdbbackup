@@ -2,7 +2,11 @@ package jobresolve
 
 import (
 	"errors"
+	"os"
+	"os/user"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/ezgamehost/ezdbbackup/internal/config"
@@ -10,9 +14,99 @@ import (
 	"github.com/ezgamehost/ezdbbackup/internal/storage"
 )
 
+// A path substitution after the secure open must not change the bytes read,
+// and the pinned descriptor must be closed on return.
+func TestResolverReadsFileSecretThroughOnePinnedDescriptor(t *testing.T) {
+	directory := secureResolverTestDir(t)
+	trusted := filepath.Join(directory, "trusted-secret")
+	attacker := filepath.Join(directory, "attacker-secret")
+	if err := os.WriteFile(trusted, []byte("trusted-value\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(attacker, []byte("attacker-value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(directory, "mysql-secret")
+	if err := os.Symlink(trusted, link); err != nil {
+		t.Fatal(err)
+	}
+	var pinned *os.File
+	resolver := Resolver{afterSecretOpen: func(file *os.File) {
+		pinned = file
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(attacker, link); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	request, err := resolver.Dump(config.JobConfig{
+		RunAs: currentResolverUsername(t),
+		MySQL: config.MySQLConfig{PasswordFile: link},
+	})
+	if err != nil {
+		t.Fatalf("Dump() error = %v", err)
+	}
+	if request.Password != "trusted-value" {
+		t.Fatalf("resolved password = %q, want trusted descriptor bytes", request.Password)
+	}
+	if pinned == nil {
+		t.Fatal("secret-open hook did not receive descriptor")
+	}
+	if _, err := pinned.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("secret descriptor Stat() error = %v, want closed", err)
+	}
+}
+
+// Replacing a previously checked path with an unsafe file must be rejected at
+// resolution time instead of relying on the earlier validation result.
+func TestResolverRejectsUnsafeOrOversizedFileSecretAtPointOfUse(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		contents string
+		mode     os.FileMode
+		want     string
+	}{
+		{name: "group writable substitute", contents: "attacker", mode: 0o660, want: "writable"},
+		{name: "oversized substitute", contents: strings.Repeat("x", config.MaxSecretFileBytes+1), mode: 0o600, want: "too large"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(secureResolverTestDir(t), "secret")
+			if err := os.WriteFile(path, []byte(tt.contents), tt.mode); err != nil {
+				t.Fatal(err)
+			}
+			_, err := (Resolver{}).Dump(config.JobConfig{
+				RunAs: currentResolverUsername(t),
+				MySQL: config.MySQLConfig{PasswordFile: path},
+			})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Dump() error = %v, want %q rejection", err, tt.want)
+			}
+		})
+	}
+}
+
+func secureResolverTestDir(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return directory
+}
+
+func currentResolverUsername(t *testing.T) string {
+	t.Helper()
+	account, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return account.Username
+}
+
 func TestResolverDumpMapsJobAndResolvesPasswordAtExecutionTime(t *testing.T) {
 	password := "first-password\n"
-	resolver := Resolver{ReadFile: func(path string) ([]byte, error) {
+	resolver := Resolver{readFile: func(path string) ([]byte, error) {
 		if path != "/secrets/mysql" {
 			t.Fatalf("ReadFile() path = %q, want /secrets/mysql", path)
 		}
@@ -76,7 +170,7 @@ func TestResolverStorageMapsJobAndResolvesCredentialFilesAtExecutionTime(t *test
 		"/secrets/secret":  "secret-one\n",
 		"/secrets/session": "session-one\n",
 	}
-	resolver := Resolver{ReadFile: func(path string) ([]byte, error) {
+	resolver := Resolver{readFile: func(path string) ([]byte, error) {
 		value, ok := values[path]
 		if !ok {
 			return nil, errors.New("unexpected secret path")
@@ -125,7 +219,7 @@ func TestResolverStorageMapsJobAndResolvesCredentialFilesAtExecutionTime(t *test
 
 func TestResolverStorageLeavesDefaultCredentialChainEnabled(t *testing.T) {
 	reads := 0
-	resolver := Resolver{ReadFile: func(string) ([]byte, error) {
+	resolver := Resolver{readFile: func(string) ([]byte, error) {
 		reads++
 		return nil, errors.New("must not read")
 	}}
@@ -144,7 +238,7 @@ func TestResolverStorageLeavesDefaultCredentialChainEnabled(t *testing.T) {
 
 func TestResolverReportsSecretReadFailureWithoutSecretValues(t *testing.T) {
 	wantErr := errors.New("read denied")
-	resolver := Resolver{ReadFile: func(string) ([]byte, error) { return nil, wantErr }}
+	resolver := Resolver{readFile: func(string) ([]byte, error) { return nil, wantErr }}
 
 	_, err := resolver.Dump(config.JobConfig{MySQL: config.MySQLConfig{PasswordFile: "/secrets/mysql"}})
 	if !errors.Is(err, wantErr) {

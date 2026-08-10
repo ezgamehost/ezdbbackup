@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -20,6 +21,51 @@ import (
 	"github.com/ezgamehost/ezdbbackup/internal/storage"
 	"github.com/ezgamehost/ezdbbackup/internal/validation"
 )
+
+// Replacing the canonical config after local validation must fail before
+// logger initialization, staging, dump execution, or network construction.
+func TestBackupRejectsLoadedConfigInodeSwapBeforeSideEffects(t *testing.T) {
+	root := secureCLITestDir(t)
+	shared := filepath.Join(root, "shared")
+	if err := os.Mkdir(shared, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+	trusted := filepath.Join(shared, "trusted.yml")
+	writeCLIConfig(t, trusted)
+	path := filepath.Join(shared, "config.yml")
+	if err := os.Symlink(trusted, path); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	deps := fakeDependencies(&stdout, &stderr)
+	deps.LoadConfig = config.Load
+	deps.Validator = validatorFunc(func(context.Context, *config.Config, []string, validation.Options) validation.Report {
+		if err := os.Rename(trusted, trusted+".original"); err != nil {
+			t.Fatal(err)
+		}
+		writeCLIConfig(t, trusted)
+		return validation.Report{}
+	})
+	loggerCalls := 0
+	deps.NewLogger = func(logging.Options) (logging.Sink, error) {
+		loggerCalls++
+		return discardSink{}, nil
+	}
+	runtime := &backupRuntime{}
+	deps.NewBackup = runtime.newService
+	deps.ExecutablePath = func() (string, error) { return "/usr/bin/true", nil }
+
+	if code := Run(context.Background(), []string{"backup", "alpha", "--config", path}, deps); code != 2 {
+		t.Fatalf("code = %d, stderr = %q; want source-safety exit 2", code, stderr.String())
+	}
+	if loggerCalls != 0 || len(runtime.dumps) != 0 {
+		t.Fatalf("side effects = logger:%d dumps:%v, want none", loggerCalls, runtime.dumps)
+	}
+}
 
 func TestBackupAcceptsFlagsBeforeAndAfterJob(t *testing.T) {
 	for _, tt := range []struct {

@@ -141,12 +141,26 @@ making a probe write files or change server state.
 
 Configured binary, configuration, staging, log, and secret paths must be clean
 absolute paths. Secure distribution-style symlinks are supported for binaries,
-configuration, secrets, and the log target: validation resolves the final
-target without following a final replacement, verifies its identity and type,
-and checks traversal through both the lexical and resolved paths. Staging keeps
-the stronger rule that every component must be symlink-free. Secret and
-configuration targets must be regular, single-link files. The cron manager
-likewise refuses a symlink, non-regular file, or multiply hard-linked file at
+configuration, secrets, and an existing log target. A missing log directory is
+created through a symlink-free descriptor walk. Configuration loading opens one
+regular descriptor, reads at most 1 MiB from it, records its canonical path and
+identity, and validates/rechecks that same source before backup or cron side
+effects. Cron entries use the canonical config target, never the originally
+requested symlink. Dump execution similarly opens and validates one executable
+descriptor at the point of use, then rechecks the trusted lexical-to-canonical
+association immediately before executing the non-replaceable requested path.
+This preserves ordinary shebang-script `argv[0]` behavior. File secrets are
+opened, validated, and read through one descriptor at the point of use.
+
+Canonical targets and ancestors must be owned by root or the intended identity
+and cannot be replaceable by unrelated users. Every lexical symbolic-link entry
+must likewise be owned by root or the intended identity; a root-owned sticky
+boundary such as `/tmp` remains supported when the protected entry has a trusted
+owner.
+Configuration and secret targets must be regular, single-link files with no
+other-user permission bits or group/other write bits. Staging keeps the stronger
+rule that every component must be symlink-free. The cron manager likewise
+refuses a symlink, non-regular file, or multiply hard-linked file at
 `/etc/cron.d/ezdbbackup`.
 
 ### Secret sources
@@ -163,6 +177,8 @@ the optional `session_token`. Literal and file forms of the same value are
 mutually exclusive. An explicit access key ID and secret access key must be
 configured together, and a session token requires both. File paths must be
 absolute. Trailing CR/LF characters are removed when a secret file is read.
+Each file-backed value is limited to 64 KiB; the temporary read buffer is
+cleared after resolution.
 
 When explicit S3 credentials are absent, ezdbbackup uses the AWS SDK default
 credential chain, including environment variables, shared AWS configuration,
@@ -227,6 +243,12 @@ fresh 30-second context, including when the original request was canceled.
 Because the gzip is completely staged before upload, an upload retry does not
 rerun `mysqldump`.
 
+The operator owns transport and endpoint trust: use TLS for untrusted networks,
+install the correct trust roots for custom HTTPS endpoints, and do not treat an
+explicit plain-HTTP endpoint as confidential transport. The operator also owns
+the S3/bucket policy for server-side at-rest encryption. ezdbbackup v1 does not
+perform client-side encryption.
+
 Human-facing S3 errors contain only a fixed operation name plus vetted API code,
 HTTP status, and request/host IDs only when the standard AWS endpoint boundary
 can trust them. Custom endpoint response IDs are omitted and their API codes use
@@ -254,12 +276,18 @@ individual failure, prints each job's lifecycle progress immediately, then
 prints one aggregate summary and fails overall if any job failed. Disabled jobs
 are excluded from `backup --all`.
 
-`backup` fails closed unless its effective OS user matches every selected
-job's `run_as`; it never executes a configured dump binary with the invoking
-user's extra privileges. Consequently, a manual `backup --all` can select only
-jobs that share one OS identity. Cron schedules jobs independently under their
-configured identities, so configurations with distinct `run_as` users remain
-supported.
+For a non-root `run_as`, `backup` fails closed unless every real, effective,
+saved, and filesystem UID equals that account's UID; every corresponding GID
+equals its primary GID; and the exact ordinary-login group set and Linux
+capability state match that account.
+Effective, permitted, and inheritable capabilities must all be empty (which
+also excludes ambient capabilities). Every selected identity is preflighted
+before any configured executable runs, and the check precedes logger
+initialization, staging, dump execution, or network construction. A
+`run_as: root` job may retain root groups and capabilities. Consequently, a
+manual `backup --all` can select only jobs compatible with one complete process
+identity. Cron schedules jobs independently under their configured identities,
+so configurations with distinct `run_as` users remain supported.
 
 `validate` with no selector is equivalent to `validate --all`; it includes
 disabled jobs so problems are caught before enabling them. An explicit job
@@ -293,8 +321,12 @@ shared writable staging target or ancestor must be sticky (as `/tmp` normally
 is), and existing path ancestors must be owned by `run_as` or root. A missing
 staging or single-user log directory is not created: validation checks whether
 `run_as` could create it beneath the nearest existing parent. A global log
-directory shared by distinct identities must already exist with the setgid
-group policy described above.
+directory shared by distinct identities must already exist as a root-owned,
+setgid, group-readable/writable/searchable, non-sticky directory. Sticky shared
+log directories are rejected because one non-root job cannot reliably rename
+or unlink rotations owned by another identity. Immediately before logger
+initialization, an existing validated log directory is pinned by device/inode;
+logger creation rejects a path that no longer names that exact directory.
 
 `--connectivity` adds a no-data/no-DDL MySQL probe and S3 `HeadBucket`. MySQL
 and S3 are reported separately. `HeadBucket` can be denied by a policy that
@@ -335,10 +367,11 @@ sudo ezdbbackup cron show
 ## Cron management
 
 `cron install` validates every configured job, resolves the current executable
-and config arguments to absolute paths, and atomically writes enabled jobs in
-lexical order to the fixed path `/etc/cron.d/ezdbbackup`. Run install/remove as
-an account permitted to manage `/etc/cron.d` (normally root). The installed file
-has mode `0644`; under normal root invocation its ownership is `root:root`.
+and loaded config source to canonical trusted paths, and atomically writes
+enabled jobs in lexical order to the fixed path `/etc/cron.d/ezdbbackup`. Run
+install/remove as an account permitted to manage `/etc/cron.d` (normally root).
+The installed file has mode `0644`; under normal root invocation its ownership
+is `root:root`.
 
 The filename is deliberately `ezdbbackup`, with no dot. Many cron daemons
 ignore `/etc/cron.d` filenames containing a dot. Do not rename it to
@@ -393,7 +426,11 @@ rotations older than `max_age_days`, and optionally compresses rotated files
 according to `compress`. Initialization performs this maintenance for error,
 info, and enabled debug logs even when that run emits no event at a level. All
 filesystem operations are directory-descriptor-relative, reject links and
-unsafe replacements, and avoid overwriting unrelated entries. The example
+unsafe replacements, and avoid overwriting unrelated entries. Enumeration uses
+128-entry reads and a per-family work budget of `256 + 4 * max_files` directory
+entries, capped at 8192. Exceeding that budget fails before any rotation shift,
+delete, or truncate, bounding memory and startup/write work even in a flooded
+shared directory. The example
 spells out all four settings so the operations policy is explicit; omitted
 settings receive the defaults described above. Do not configure system
 `logrotate` for these files: two rotation owners can race or defeat the
@@ -412,6 +449,11 @@ with mode `0600`. The file is complete before S3 upload starts. Allow enough
 free space for the largest complete compressed dump plus filesystem overhead.
 `backup --all` is sequential, so jobs do not intentionally stage in parallel
 within one process; separate manual/cron invocations can still overlap.
+
+Both the staged `.sql.gz` file and the uploaded object are compressed plaintext,
+not client-side ciphertext. Protect staging storage accordingly and configure
+the destination bucket's at-rest encryption and access policy to meet your
+requirements.
 
 Staging records the parent/work-directory and file device, inode, size, type,
 mode, and link identity. Before upload, the file is reopened relative to the
