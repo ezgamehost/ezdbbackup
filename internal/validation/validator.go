@@ -3,7 +3,6 @@ package validation
 import (
 	"context"
 	"fmt"
-	"os/user"
 	"sort"
 	"strings"
 
@@ -27,33 +26,15 @@ type Checker interface {
 	Check(context.Context, *config.Config, []string, Options) Report
 }
 
-// CurrentUserProvider supplies the invoking user identity for connectivity
-// diagnostics.
-type CurrentUserProvider interface {
-	CurrentUsername() (string, error)
-}
-
-// OSCurrentUser reads the user identity of the process invoking validation.
-type OSCurrentUser struct{}
-
-func (OSCurrentUser) CurrentUsername() (string, error) {
-	current, err := user.Current()
-	if err != nil {
-		return "", fmt.Errorf("lookup invoking user: %w", err)
-	}
-	return current.Username, nil
-}
-
 // Validator coordinates pure configuration checks, local environment checks,
 // and optional read-only connectivity probes. Executable version checks use
-// the configured run_as identity when validation is invoked by root.
-// Connectivity probes remain in the invoking process identity.
+// the exact configured run_as process identity. Connectivity probes require
+// that same complete identity before any configured code or remote client runs.
 type Validator struct {
 	Environment Environment
 	Resolve     jobresolve.OptionsResolver
 	Dump        dump.Runner
 	Stores      storage.Factory
-	CurrentUser CurrentUserProvider
 }
 
 func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []string, options Options) Report {
@@ -93,23 +74,23 @@ func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []str
 	report = appendCheck(report, "", "cron_config_path", "configuration path is unsafe for cron", v.Environment.CheckCronPath(options.ConfigPath))
 	logRunAs := make([]string, 0, len(cfg.Jobs))
 	seenLogRunAs := make(map[string]bool)
-	for _, enabledName := range cfg.EnabledJobNames() {
-		runAs := cfg.Jobs[enabledName].RunAs
+	for _, name := range names {
+		runAs := cfg.Jobs[name].RunAs
 		if !seenLogRunAs[runAs] {
 			seenLogRunAs[runAs] = true
 			logRunAs = append(logRunAs, runAs)
 		}
 	}
 	allExecutionIdentitiesOK := true
-	if options.BackupExecution {
-		// A backup invocation is one privilege boundary. Prove every selected
-		// job is compatible before executing even the first configured binary;
-		// otherwise backup --all could run one job's code before a later
-		// identity mismatch makes the invocation fail.
+	if options.BackupExecution || options.Connectivity {
+		// Backup and connectivity validation are each one privilege boundary.
+		// Prove every selected job is compatible before executing even the first
+		// configured binary or constructing a remote client; otherwise an
+		// earlier job could run before a later identity mismatch fails the run.
 		for _, name := range names {
 			job := cfg.Jobs[name]
 			if err := v.Environment.CheckRunIdentity(job.RunAs); err != nil {
-				report = appendCheck(report, name, "execution_identity", "backup process identity does not match configured run_as", err)
+				report = appendCheck(report, name, "execution_identity", "process identity does not match configured run_as", err)
 				prerequisites[name].mysqlLocal = false
 				prerequisites[name].s3Local = false
 				allExecutionIdentitiesOK = false
@@ -132,19 +113,17 @@ func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []str
 			state.mysqlLocal = false
 			state.s3Local = false
 		}
-		if job.Enabled {
-			if allExecutionIdentitiesOK {
-				if err := v.Environment.CheckRuntimeExecutable(ctx, options.BinaryPath, job.RunAs); err != nil {
-					report = appendCheck(report, name, "runtime_executable", "scheduled ezdbbackup executable is unavailable or unsafe", err)
-					state.mysqlLocal = false
-					state.s3Local = false
-				}
-			}
-			if err := checkConfigurationSource(v.Environment, cfg, options.ConfigPath, job.RunAs); err != nil {
-				report = appendCheck(report, name, "configuration_file", "configuration file is unreadable or unsafe for scheduled execution", err)
+		if allExecutionIdentitiesOK {
+			if err := v.Environment.CheckRuntimeExecutable(ctx, options.BinaryPath, job.RunAs); err != nil {
+				report = appendCheck(report, name, "runtime_executable", "ezdbbackup executable is unavailable or unsafe", err)
 				state.mysqlLocal = false
 				state.s3Local = false
 			}
+		}
+		if err := checkConfigurationSource(v.Environment, cfg, options.ConfigPath, job.RunAs); err != nil {
+			report = appendCheck(report, name, "configuration_file", "configuration file is unreadable or unsafe for execution", err)
+			state.mysqlLocal = false
+			state.s3Local = false
 		}
 		if allExecutionIdentitiesOK {
 			if err := checkExecutable(ctx, v.Environment, job.DumpBinary, job.RunAs); err != nil {
@@ -172,26 +151,11 @@ func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []str
 
 	}
 	if len(logRunAs) > 0 {
-		report = appendCheck(report, "", "log_directory", "global log directory is incompatible with enabled run_as identities", v.Environment.CheckLoggingTarget(cfg.Logging.Directory, logRunAs))
+		report = appendCheck(report, "", "log_directory", "global log directory is incompatible with selected run_as identities", v.Environment.CheckLoggingTarget(cfg.Logging.Directory, logRunAs))
 	}
 	if options.Connectivity {
-		currentUser := v.CurrentUser
-		if currentUser == nil {
-			currentUser = OSCurrentUser{}
-		}
-		invokingUser, currentUserErr := currentUser.CurrentUsername()
 		for _, name := range names {
 			job := cfg.Jobs[name]
-			if currentUserErr != nil {
-				report = report.Append(Finding{
-					Severity: SeverityWarning,
-					Job:      name,
-					Check:    "connectivity_identity",
-					Message:  fmt.Sprintf("could not determine invoking user: %v; connectivity probes still use the invoking process, not configured run_as user %q", currentUserErr, job.RunAs),
-				})
-			} else if invokingUser != job.RunAs {
-				report = report.Append(connectivityIdentityWarning(name, invokingUser, job.RunAs))
-			}
 			report = v.checkConnectivity(ctx, report, name, job, *prerequisites[name])
 		}
 	}
@@ -209,20 +173,6 @@ func checkConfigurationSource(environment Environment, cfg *config.Config, fallb
 		}
 	}
 	return environment.CheckConfigFile(fallbackPath, runAs)
-}
-
-func connectivityIdentityWarning(job, invokingUser, runAs string) Finding {
-	return Finding{
-		Severity: SeverityWarning,
-		Job:      job,
-		Check:    "connectivity_identity",
-		Message: fmt.Sprintf(
-			"connectivity probes use invoking user %q, not configured run_as user %q; to test with the scheduled-job identity, run `sudo -u %s ezdbbackup validate --connectivity`",
-			invokingUser,
-			runAs,
-			runAs,
-		),
-	}
 }
 
 func checkExecutable(ctx context.Context, environment Environment, path, runAs string) error {

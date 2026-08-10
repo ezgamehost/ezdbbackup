@@ -132,12 +132,14 @@ spellings are rejected too. This prevents a backup configuration from uploading
 help text or writing an unprotected side copy. Normal dump-shaping long options
 such as `--single-transaction` and `--quick` remain supported.
 
-Connectivity probes do not reuse dump-shaping `extra_args`. They copy only an
+Backup and connectivity invocations both place `--no-defaults` first, then use
+the same configured host, port, user, and authentication baseline. This
+disables ordinary MySQL option files such as `~/.my.cnf`, preventing inherited
+result-file, init-command, or replica controls from creating side effects.
+Connectivity probes do not reuse dump-shaping `extra_args`; they copy only an
 audited set of transport, authentication-plugin, and TLS options, force
-no-data/no-DDL output, disable ordinary MySQL option files, table locks, and log
-flushing/deletion before selecting the configured databases. Disabling option
-files prevents inherited result-file, init-command, or replica controls from
-making a probe write files or change server state.
+no-data/no-DDL output, and disable table locks and log flushing/deletion before
+selecting the configured databases.
 
 Configured binary, configuration, staging, log, and secret paths must be clean
 absolute paths. Secure distribution-style symlinks are supported for binaries,
@@ -166,11 +168,11 @@ refuses a symlink, non-regular file, or multiply hard-linked file at
 ### Secret sources
 
 MySQL accepts either `password` or `password_file`, never both. Omitting both
-uses whatever authentication the `mysqldump` process already has, such as an
-operator-managed login path or option file, for actual backups. Connectivity
-probes start `mysqldump` with `--no-defaults` for safety, so authentication kept
-only in a regular option file is not available to the probe. Configure a job
-password source (or a supported MySQL login path) when using `--connectivity`.
+uses authentication the `mysqldump` client still supports with `--no-defaults`,
+such as an operator-managed MySQL login-path file where supported. Ordinary
+option files are unavailable to both backups and connectivity probes. Configure
+a job password source or a supported MySQL login path when authentication is
+required; ezdbbackup never generates either kind of file.
 
 S3 has literal and `_file` forms for `access_key_id`, `secret_access_key`, and
 the optional `session_token`. Literal and file forms of the same value are
@@ -204,8 +206,9 @@ This avoids exposing a password in command-line listings and avoids managing a
 temporary option file, but environment inspection may still be possible to a
 privileged user or to the same OS account on some systems. Restrict host access,
 use a least-privilege MySQL backup account, and prefer a user-managed MySQL
-login path or protected option file when that better matches the host's threat
-model.
+login path when that better matches the host's threat model. Ordinary option
+files are intentionally disabled by the command line and cannot supply backup
+credentials or behavior.
 
 ### Custom S3 endpoints
 
@@ -278,9 +281,11 @@ ezdbbackup version
 
 `backup <job>` requires that named job to exist and be enabled. `backup --all`
 runs enabled jobs sequentially in lexical job-name order, continues after an
-individual failure, prints each job's lifecycle progress immediately, then
-prints one aggregate summary and fails overall if any job failed. Disabled jobs
-are excluded from `backup --all`.
+individual failure, and prints each job's lifecycle progress immediately. It
+then prints one terminal-safe `<job>: succeeded` or `<job>: failed` outcome per
+result in execution order, with no raw error text, followed by the aggregate
+counts. It fails overall if any job failed. A zero-job run prints only the
+zero-count aggregate. Disabled jobs are excluded from `backup --all`.
 
 For a non-root `run_as`, `backup` fails closed unless every real, effective,
 saved, and filesystem UID equals that account's UID; every corresponding GID
@@ -318,11 +323,13 @@ JSON Lines in the configured log directory.
 ## Validation and execution identity
 
 Default validation is local and side-effect free. It validates the complete
-schema and cron-safe paths; checks `run_as`; proves that every enabled
+schema and cron-safe paths; checks `run_as`; proves that every selected
 `run_as` can traverse and execute both the configured dump binary and the
 current ezdbbackup binary, and can traverse and read the effective
 configuration; invokes executables with `--version`; checks staging/log
-directory policy; and checks file-backed secrets. A
+directory policy; and checks file-backed secrets. These readiness checks apply
+to disabled selected jobs too, so the default all-job validation and an
+explicit disabled-job validation find problems before enablement. A
 shared writable staging target or ancestor must be sticky (as `/tmp` normally
 is), and existing path ancestors must be owned by `run_as` or root. A missing
 staging or single-user log directory is not created: validation checks whether
@@ -340,13 +347,13 @@ still permits uploads, so that error is diagnostic rather than proof that an
 upload can never work.
 
 > **Important identity behavior:** filesystem permissions are evaluated for
-> each job's configured `run_as`. Executable `--version` probes also run as
-> `run_as` when validation is invoked by root; a same-user invocation keeps its
-> current identity, and an unprivileged cross-user invocation fails closed
-> instead of executing another user's binary. Connectivity probes still run as
-> the OS user invoking ezdbbackup. With `--connectivity`, a different invoking
-> user produces a warning. To reproduce scheduled-job behavior, retain the same
-> selector and configuration path and run exactly the corresponding form:
+> each job's configured `run_as`. With `--connectivity`, the complete current
+> process identity must match every selected job's `run_as`, using the same
+> real/effective/saved/filesystem UID and GID, supplementary-group, and Linux
+> capability rule as backup. A mismatch is an error before any selected
+> configured executable/version/connectivity probe or S3 client construction.
+> Jobs with distinct `run_as` identities must be checked in separate invocations
+> by retaining the selector and configuration path:
 >
 > `sudo -u <run_as> ezdbbackup validate [job|--all] --connectivity --config /absolute/path/to/config.yml`
 >
@@ -355,6 +362,9 @@ upload can never work.
 > `sudo -u ezdbbackup ezdbbackup validate production --connectivity --config /etc/ezdbbackup/config.yml`
 >
 > `sudo -u ezdbbackup ezdbbackup validate --all --connectivity --config /etc/ezdbbackup/config.yml`
+>
+> The `--all` form is valid only when every selected job uses that same complete
+> process identity.
 
 The selected account must also have access to any AWS credential source being
 tested. `sudo` may intentionally discard environment credentials; account for

@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/ezgamehost/ezdbbackup/internal/config"
 	"github.com/ezgamehost/ezdbbackup/internal/dump"
+	"github.com/ezgamehost/ezdbbackup/internal/securepath"
 	"github.com/ezgamehost/ezdbbackup/internal/storage"
 )
 
@@ -33,9 +36,10 @@ func TestValidatorChecksEveryJobIncludingDisabledInLexicalOrder(t *testing.T) {
 		"user:alpha-user", "runtime-executable:/usr/local/bin/ezdbbackup:alpha-user", "config:/etc/ezdbbackup/config.yml:alpha-user",
 		"executable:/dump/alpha:alpha-user", "staging:/tmp/alpha:alpha-user",
 		"secret:/secrets/alpha-mysql:alpha-user", "secret:/secrets/alpha-access:alpha-user", "secret:/secrets/alpha-secret:alpha-user", "secret:/secrets/alpha-session:alpha-user",
-		"user:zulu-user", "executable:/dump/zulu:zulu-user", "staging:/tmp/zulu:zulu-user",
+		"user:zulu-user", "runtime-executable:/usr/local/bin/ezdbbackup:zulu-user", "config:/etc/ezdbbackup/config.yml:zulu-user",
+		"executable:/dump/zulu:zulu-user", "staging:/tmp/zulu:zulu-user",
 		"secret:/secrets/zulu-mysql:zulu-user", "secret:/secrets/zulu-access:zulu-user", "secret:/secrets/zulu-secret:zulu-user", "secret:/secrets/zulu-session:zulu-user",
-		"logging:/logs:alpha-user",
+		"logging:/logs:alpha-user,zulu-user",
 	}
 	if !reflect.DeepEqual(env.calls, want) {
 		t.Fatalf("environment calls = %#v, want %#v", env.calls, want)
@@ -45,7 +49,7 @@ func TestValidatorChecksEveryJobIncludingDisabledInLexicalOrder(t *testing.T) {
 	}
 }
 
-func TestValidatorProvesScheduledConfigBinaryAndGlobalLogAccess(t *testing.T) {
+func TestValidatorProvesReadinessAndGlobalLogAccessForEnabledAndDisabledJobs(t *testing.T) {
 	cfg := validValidationConfig()
 	cfg.Logging.Directory = "/shared/logs"
 	cfg.Jobs["alpha"] = validValidationJob("alpha", true)
@@ -66,16 +70,69 @@ func TestValidatorProvesScheduledConfigBinaryAndGlobalLogAccess(t *testing.T) {
 		"config:/etc/ezdbbackup/config.yml:alpha-user",
 		"runtime-executable:/usr/local/bin/ezdbbackup:bravo-user",
 		"config:/etc/ezdbbackup/config.yml:bravo-user",
-		"logging:/shared/logs:alpha-user,bravo-user",
+		"runtime-executable:/usr/local/bin/ezdbbackup:disabled-user",
+		"config:/etc/ezdbbackup/config.yml:disabled-user",
+		"logging:/shared/logs:alpha-user,bravo-user,disabled-user",
 	}
 	for _, want := range wantCalls {
 		if !slicesContains(env.calls, want) {
 			t.Fatalf("environment calls = %#v, missing %q", env.calls, want)
 		}
 	}
+}
+
+func TestValidatorAllDisabledJobsReceiveReadinessChecks(t *testing.T) {
+	cfg := validValidationConfig()
+	cfg.Jobs["alpha"] = validValidationJob("alpha", false)
+	cfg.Jobs["zulu"] = validValidationJob("zulu", false)
+	env := &fakeEnvironment{}
+
+	report := newValidator(env, &fakeRemoteDependencies{}).Check(context.Background(), cfg, nil, Options{
+		BinaryPath: "/bin/ezdbbackup",
+		ConfigPath: "/etc/ezdbbackup/config.yml",
+	})
+	if report.HasErrors() {
+		t.Fatalf("Check(all disabled) findings = %#v", report.Findings)
+	}
+	for _, want := range []string{
+		"runtime-executable:/bin/ezdbbackup:alpha-user",
+		"config:/etc/ezdbbackup/config.yml:alpha-user",
+		"executable:/dump/alpha:alpha-user",
+		"runtime-executable:/bin/ezdbbackup:zulu-user",
+		"config:/etc/ezdbbackup/config.yml:zulu-user",
+		"executable:/dump/zulu:zulu-user",
+		"logging:/logs:alpha-user,zulu-user",
+	} {
+		if !slicesContains(env.calls, want) {
+			t.Fatalf("environment calls = %#v, missing disabled readiness check %q", env.calls, want)
+		}
+	}
+}
+
+func TestValidatorExplicitDisabledJobUsesPinnedConfigAndOnlySelectedLogIdentity(t *testing.T) {
+	cfg, configPath := loadDisabledValidationConfig(t)
+	env := &fakeEnvironment{}
+
+	report := newValidator(env, &fakeRemoteDependencies{}).Check(context.Background(), cfg, []string{"disabled"}, Options{
+		BinaryPath: "/bin/ezdbbackup",
+		ConfigPath: configPath,
+	})
+	if report.HasErrors() {
+		t.Fatalf("Check(explicit disabled) findings = %#v", report.Findings)
+	}
+	for _, want := range []string{
+		"runtime-executable:/bin/ezdbbackup:disabled-user",
+		"config-source:" + configPath + ":disabled-user",
+		"executable:/dump/disabled:disabled-user",
+		"logging:/logs:disabled-user",
+	} {
+		if !slicesContains(env.calls, want) {
+			t.Fatalf("environment calls = %#v, missing explicit disabled check %q", env.calls, want)
+		}
+	}
 	for _, call := range env.calls {
-		if strings.Contains(call, "runtime-executable:") && strings.HasSuffix(call, ":disabled-user") {
-			t.Fatalf("disabled job received scheduled runtime check: %q", call)
+		if strings.Contains(call, "alpha-user") {
+			t.Fatalf("explicit disabled validation checked unselected alpha identity: %q", call)
 		}
 	}
 }
@@ -184,8 +241,8 @@ func TestValidatorSelectedJobsLimitConfigurationAndEnvironmentChecks(t *testing.
 			t.Fatalf("unselected alpha environment call = %q", call)
 		}
 	}
-	if !slicesContains(env.calls, "logging:/logs:alpha-user,bravo-user") {
-		t.Fatalf("environment calls = %#v, want global log invariant across every enabled job", env.calls)
+	if !slicesContains(env.calls, "logging:/logs:bravo-user") {
+		t.Fatalf("environment calls = %#v, want log compatibility for selected job only", env.calls)
 	}
 }
 
@@ -336,7 +393,6 @@ func TestValidatorConnectivityRedactsResolvedSecretsAndPreservesCauses(t *testin
 				Resolve:     remote,
 				Dump:        remote,
 				Stores:      remote,
-				CurrentUser: &fakeCurrentUser{name: job.RunAs},
 			}
 
 			report := validator.Check(context.Background(), cfg, []string{"alpha"}, Options{
@@ -372,94 +428,104 @@ func TestValidatorConnectivityRedactsResolvedSecretsAndPreservesCauses(t *testin
 	}
 }
 
-func TestValidatorConnectivityWarnsWhenInvokingUserDiffersAndStillProbes(t *testing.T) {
-	tests := []struct {
-		name     string
-		ambient  bool
-		jobNames []string
-	}{
-		{name: "explicit credentials", jobNames: []string{"zulu", "alpha"}},
-		{name: "ambient credentials", ambient: true, jobNames: []string{"zulu", "alpha"}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := validValidationConfig()
-			for _, name := range []string{"zulu", "alpha"} {
-				job := validValidationJob(name, true)
-				if tt.ambient {
-					job.MySQL.PasswordFile = ""
-					job.S3.AccessKeyIDFile = ""
-					job.S3.SecretAccessKeyFile = ""
-					job.S3.SessionTokenFile = ""
-				}
-				cfg.Jobs[name] = job
-			}
-			remote := &fakeRemoteDependencies{}
-			current := &fakeCurrentUser{name: "operator"}
-			validator := newValidator(&fakeEnvironment{}, remote)
-			validator.CurrentUser = current
-
-			report := validator.Check(context.Background(), cfg, tt.jobNames, Options{
-				Connectivity: true,
-				BinaryPath:   "/bin/ezdbbackup",
-				ConfigPath:   "/etc/ezdbbackup/config.yml",
-			})
-
-			if report.HasErrors() {
-				t.Fatalf("Check() report = %#v, want warning-only report", report.Findings)
-			}
-			if current.calls != 1 {
-				t.Fatalf("CurrentUsername calls = %d, want 1", current.calls)
-			}
-			wantJobs := []string{"alpha", "zulu"}
-			var warningJobs []string
-			for _, finding := range report.Findings {
-				if finding.Check != "connectivity_identity" {
-					continue
-				}
-				warningJobs = append(warningJobs, finding.Job)
-				if finding.Severity != SeverityWarning {
-					t.Errorf("identity finding severity = %q, want warning", finding.Severity)
-				}
-				if !strings.Contains(finding.Message, "probes use invoking user \"operator\"") ||
-					!strings.Contains(finding.Message, "sudo -u "+finding.Job+"-user ezdbbackup validate --connectivity") {
-					t.Errorf("identity finding message = %q, want invoking identity and rerun recommendation", finding.Message)
-				}
-			}
-			if !reflect.DeepEqual(warningJobs, wantJobs) {
-				t.Fatalf("identity warning jobs = %#v, want lexical %#v", warningJobs, wantJobs)
-			}
-			wantCalls := []string{
-				"resolve-dump:alpha", "dump-probe:alpha", "resolve-storage:alpha", "new-store:alpha", "store-probe:alpha-bucket",
-				"resolve-dump:zulu", "dump-probe:zulu", "resolve-storage:zulu", "new-store:zulu", "store-probe:zulu-bucket",
-			}
-			if !reflect.DeepEqual(remote.calls, wantCalls) {
-				t.Fatalf("connectivity calls = %#v, want probes to continue %#v", remote.calls, wantCalls)
-			}
-		})
-	}
-}
-
-func TestValidatorConnectivityDoesNotWarnForSameInvokingUser(t *testing.T) {
+func TestValidatorConnectivityIdentityMismatchFailsBeforeConfiguredOrRemoteExecution(t *testing.T) {
 	cfg := validValidationConfig()
 	job := validValidationJob("alpha", true)
-	job.RunAs = "operator"
+	job.MySQL.PasswordFile = ""
+	job.S3.AccessKeyIDFile = ""
+	job.S3.SecretAccessKeyFile = ""
+	job.S3.SessionTokenFile = ""
 	cfg.Jobs["alpha"] = job
+	env := &fakeEnvironment{errors: map[string]error{
+		"run-identity:alpha-user": errors.New("effective user is root, not alpha-user"),
+	}}
 	remote := &fakeRemoteDependencies{}
-	validator := newValidator(&fakeEnvironment{}, remote)
-	validator.CurrentUser = &fakeCurrentUser{name: "operator"}
 
-	report := validator.Check(context.Background(), cfg, nil, Options{
+	report := newValidator(env, remote).Check(context.Background(), cfg, []string{"alpha"}, Options{
 		Connectivity: true,
 		BinaryPath:   "/bin/ezdbbackup",
 		ConfigPath:   "/etc/ezdbbackup/config.yml",
 	})
 
-	if hasFinding(report, "alpha", "connectivity_identity", "") {
-		t.Fatalf("Check() findings = %#v, want no same-user identity warning", report.Findings)
+	finding := findFindingWithMessage(report, "alpha", "execution_identity", "configured run_as")
+	if finding == nil || finding.Severity != SeverityError {
+		t.Fatalf("findings = %#v, want error execution-identity finding", report.Findings)
 	}
-	if len(remote.calls) != 5 {
-		t.Fatalf("connectivity calls = %#v, want both probes", remote.calls)
+	if len(remote.calls) != 0 {
+		t.Fatalf("remote calls = %#v, want no resolver, probe, or default-chain S3 construction", remote.calls)
+	}
+	for _, call := range env.calls {
+		if strings.HasPrefix(call, "runtime-executable:") || strings.HasPrefix(call, "executable:") {
+			t.Fatalf("environment calls = %#v, configured code ran after connectivity identity mismatch", env.calls)
+		}
+	}
+}
+
+func TestValidatorConnectivityPreflightsEverySelectedIdentityBeforeAnyProbe(t *testing.T) {
+	cfg := validValidationConfig()
+	cfg.Jobs["alpha"] = validValidationJob("alpha", true)
+	cfg.Jobs["zulu"] = validValidationJob("zulu", true)
+	env := &fakeEnvironment{errors: map[string]error{
+		"run-identity:zulu-user": errors.New("supplementary groups differ"),
+	}}
+	remote := &fakeRemoteDependencies{}
+
+	report := newValidator(env, remote).Check(context.Background(), cfg, []string{"alpha", "zulu"}, Options{
+		Connectivity: true,
+		BinaryPath:   "/bin/ezdbbackup",
+		ConfigPath:   "/etc/ezdbbackup/config.yml",
+	})
+	if !hasFinding(report, "zulu", "execution_identity", "configured run_as") {
+		t.Fatalf("findings = %#v, want later-job identity failure", report.Findings)
+	}
+	if len(remote.calls) != 0 {
+		t.Fatalf("remote calls = %#v, later mismatch must prevent earlier probes and S3 clients", remote.calls)
+	}
+	wantIdentityCalls := []string{"run-identity:alpha-user", "run-identity:zulu-user"}
+	var identityCalls []string
+	for _, call := range env.calls {
+		if strings.HasPrefix(call, "run-identity:") {
+			identityCalls = append(identityCalls, call)
+		}
+	}
+	if !reflect.DeepEqual(identityCalls, wantIdentityCalls) {
+		t.Fatalf("identity calls = %#v, want complete lexical preflight %#v", identityCalls, wantIdentityCalls)
+	}
+	for _, call := range env.calls {
+		if strings.HasPrefix(call, "runtime-executable:") || strings.HasPrefix(call, "executable:") {
+			t.Fatalf("environment calls = %#v, configured executable ran after later identity mismatch", env.calls)
+		}
+	}
+}
+
+func TestValidatorConnectivityExactIdentityRunsConfiguredAndRemoteChecks(t *testing.T) {
+	cfg := validValidationConfig()
+	cfg.Jobs["alpha"] = validValidationJob("alpha", true)
+	env := &fakeEnvironment{}
+	remote := &fakeRemoteDependencies{}
+
+	report := newValidator(env, remote).Check(context.Background(), cfg, []string{"alpha"}, Options{
+		Connectivity: true,
+		BinaryPath:   "/bin/ezdbbackup",
+		ConfigPath:   "/etc/ezdbbackup/config.yml",
+	})
+	if report.HasErrors() {
+		t.Fatalf("Check(exact identity) findings = %#v", report.Findings)
+	}
+	for _, want := range []string{
+		"run-identity:alpha-user",
+		"runtime-executable:/bin/ezdbbackup:alpha-user",
+		"executable:/dump/alpha:alpha-user",
+	} {
+		if !slicesContains(env.calls, want) {
+			t.Fatalf("environment calls = %#v, missing %q", env.calls, want)
+		}
+	}
+	wantRemote := []string{
+		"resolve-dump:alpha", "dump-probe:alpha", "resolve-storage:alpha", "new-store:alpha", "store-probe:alpha-bucket",
+	}
+	if !reflect.DeepEqual(remote.calls, wantRemote) {
+		t.Fatalf("remote calls = %#v, want exact-identity probes %#v", remote.calls, wantRemote)
 	}
 }
 
@@ -616,6 +682,10 @@ func (f *fakeEnvironment) CheckConfigFile(path, runAs string) error {
 	return f.call("config:" + path + ":" + runAs)
 }
 
+func (f *fakeEnvironment) CheckConfigSource(source securepath.Source, runAs string) error {
+	return f.call("config-source:" + source.CanonicalPath + ":" + runAs)
+}
+
 func (f *fakeEnvironment) CheckWritableTarget(path, runAs string) error {
 	return f.call("writable:" + path + ":" + runAs)
 }
@@ -753,17 +823,6 @@ type recordingResolver struct {
 	read func(string) ([]byte, error)
 }
 
-type fakeCurrentUser struct {
-	name  string
-	err   error
-	calls int
-}
-
-func (f *fakeCurrentUser) CurrentUsername() (string, error) {
-	f.calls++
-	return f.name, f.err
-}
-
 func (r recordingResolver) Dump(job config.JobConfig) (dump.Request, error) {
 	password, err := job.MySQL.PasswordRef().Resolve(r.read)
 	return dump.Request{Host: job.MySQL.Host, Password: password}, err
@@ -816,6 +875,64 @@ func validValidationJob(name string, enabled bool) config.JobConfig {
 			SessionTokenFile:    "/secrets/" + name + "-session",
 		},
 	}
+}
+
+func loadDisabledValidationConfig(t *testing.T) (*config.Config, string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.yml")
+	contents := `version: 1
+defaults:
+  dump_binary: /dump/default
+  temp_dir: /tmp/default
+logging:
+  directory: /logs
+  rotation:
+    max_size_mb: 1
+    max_files: 1
+    max_age_days: 1
+    compress: true
+jobs:
+  alpha:
+    enabled: true
+    schedule: "0 2 * * *"
+    run_as: alpha-user
+    dump_binary: /dump/alpha
+    temp_dir: /tmp/alpha
+    mysql:
+      host: alpha
+      port: 3306
+      user: backup
+      databases: [app]
+    s3:
+      bucket: alpha-bucket
+      region: us-east-1
+  disabled:
+    enabled: false
+    schedule: "0 2 * * *"
+    run_as: disabled-user
+    dump_binary: /dump/disabled
+    temp_dir: /tmp/disabled
+    mysql:
+      host: disabled
+      port: 3306
+      user: backup
+      databases: [app]
+    s3:
+      bucket: disabled-bucket
+      region: us-east-1
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, findings := config.Load(path)
+	if findings.HasErrors() {
+		t.Fatalf("load disabled validation config: %v", findings)
+	}
+	return cfg, path
 }
 
 func hasFinding(report Report, job, check, messagePart string) bool {

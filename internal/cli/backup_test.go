@@ -342,8 +342,41 @@ func TestBackupAllRunsLexicallyContinuesAndSummarizes(t *testing.T) {
 	}
 	out := stdout.String()
 	alphaAt, zuluAt := strings.Index(out, "alpha: failed at dump_execution:"), strings.Index(out, "zulu: upload complete ")
-	if alphaAt < 0 || zuluAt <= alphaAt || !strings.Contains(out, "backup summary: 1 succeeded, 1 failed\n") {
+	alphaResultAt := strings.LastIndex(out, "alpha: failed\n")
+	zuluResultAt := strings.LastIndex(out, "zulu: succeeded\n")
+	aggregateAt := strings.LastIndex(out, "backup summary: 1 succeeded, 1 failed\n")
+	if alphaAt < 0 || zuluAt <= alphaAt || alphaResultAt <= zuluAt || zuluResultAt <= alphaResultAt || aggregateAt <= zuluResultAt {
 		t.Fatalf("stdout = %q", out)
+	}
+}
+
+func TestPrintBackupSummaryReportsOrderedOutcomesWithoutErrorText(t *testing.T) {
+	const secret = "secret-bearing dump failure"
+	var stdout bytes.Buffer
+	printBackupSummary(backup.Summary{Results: []backup.JobResult{
+		{Result: backup.Result{Job: "alpha"}, Err: errors.New(secret)},
+		{Result: backup.Result{Job: "zulu"}},
+	}}, Dependencies{Stdout: &stdout})
+
+	want := "alpha: failed\nzulu: succeeded\nbackup summary: 1 succeeded, 1 failed\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("summary output = %q, want %q", got, want)
+	}
+	if strings.Contains(stdout.String(), secret) {
+		t.Fatalf("summary output exposed result error: %q", stdout.String())
+	}
+}
+
+func TestPrintBackupSummaryEncodesJobNameOnOnePhysicalLine(t *testing.T) {
+	job := "alpha\nforged:\x1b[31mfailed\u202e"
+	var stdout bytes.Buffer
+	printBackupSummary(backup.Summary{Results: []backup.JobResult{{
+		Result: backup.Result{Job: job},
+	}}}, Dependencies{Stdout: &stdout})
+
+	want := encoded(job) + ": succeeded\nbackup summary: 1 succeeded, 0 failed\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("summary output = %q, want terminal-safe %q", got, want)
 	}
 }
 

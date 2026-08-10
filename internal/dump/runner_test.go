@@ -42,7 +42,7 @@ func TestExecRunnerRunStreamsOutputAndIsolatesPassword(t *testing.T) {
 		t.Fatalf("parent MYSQL_PWD = %q, want inherited value", got)
 	}
 	if got, want := strings.Fields(readFixtureFile(t, argsPath)), []string{
-		"--host=db.internal", "--port=3307", "--user=backup", "--databases", "--", "app",
+		"--no-defaults", "--host=db.internal", "--port=3307", "--user=backup", "--databases", "--", "app",
 	}; !slices.Equal(got, want) {
 		t.Fatalf("arguments = %#v, want %#v", got, want)
 	}

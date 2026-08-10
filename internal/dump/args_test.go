@@ -14,7 +14,7 @@ func TestArgsForSelectedDatabases(t *testing.T) {
 		ExtraArgs: []string{"--single-transaction"},
 	}
 	want := []string{
-		"--host=db.internal", "--port=3307", "--user=backup",
+		"--no-defaults", "--host=db.internal", "--port=3307", "--user=backup",
 		"--single-transaction", "--databases", "--", "app", "analytics",
 	}
 	if got := Args(req); !slices.Equal(got, want) {
@@ -26,9 +26,21 @@ func TestArgsForSelectedDatabases(t *testing.T) {
 // backup, which would change the data mysqldump exports.
 func TestArgsForAllDatabases(t *testing.T) {
 	req := Request{Host: "db.internal", Port: 3307, User: "backup", AllDatabases: true}
-	want := []string{"--host=db.internal", "--port=3307", "--user=backup", "--all-databases"}
+	want := []string{"--no-defaults", "--host=db.internal", "--port=3307", "--user=backup", "--all-databases"}
 	if got := Args(req); !slices.Equal(got, want) {
 		t.Fatalf("Args() = %#v, want %#v", got, want)
+	}
+}
+
+// This fails if backup and connectivity validation stop sharing the same
+// safety-first option-file and configured connection baseline.
+func TestBackupAndProbeArgsShareNoDefaultsConnectionBaseline(t *testing.T) {
+	req := Request{Host: "db.internal", Port: 3307, User: "backup", Databases: []string{"app"}}
+	want := []string{"--no-defaults", "--host=db.internal", "--port=3307", "--user=backup"}
+	for name, args := range map[string][]string{"backup": Args(req), "probe": ProbeArgs(req)} {
+		if len(args) < len(want) || !slices.Equal(args[:len(want)], want) {
+			t.Fatalf("%s connection baseline = %#v, want %#v", name, args, want)
+		}
 	}
 }
 

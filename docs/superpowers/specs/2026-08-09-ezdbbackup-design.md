@@ -105,7 +105,7 @@ jobs:
 - `databases` is required. It is either the scalar `all` or a non-empty list of database names. `all` invokes `mysqldump --all-databases`; no database scope is inferred silently.
 - A password may be supplied as `password` or `password_file`, but never both. A referenced password file is read at execution time and must be an absolute path.
 - `ezdbbackup` does not generate MySQL option files. A configured password is placed in `MYSQL_PWD` only in the child `mysqldump` environment. It is never appended to the command line or inherited by unrelated processes.
-- Users may omit both password fields and rely on MySQL authentication already configured for the `mysqldump` process, including a user-managed login path or option file.
+- Backup and connectivity invocations both place `--no-defaults` first and therefore never read ordinary MySQL option files such as `~/.my.cnf`. Users may omit both password fields and rely on authentication that the client still supports with `--no-defaults`, including a user-managed MySQL login-path file where supported.
 - `extra_args` is an optional ordered list passed to `mysqldump`. `ezdbbackup` owns the output destination, selected databases, connection fields, and configured password handling; validation rejects extra arguments that conflict with those owned settings.
 
 ### S3 settings
@@ -131,7 +131,7 @@ ezdbbackup version
 
 With no job argument, `validate` is equivalent to `validate --all`. Validation includes disabled jobs so configuration errors are found before those jobs are enabled. `backup --all` runs only enabled jobs. Naming a disabled job explicitly for backup is an error.
 
-`backup --all` runs jobs sequentially in lexical job-name order. A failed job does not prevent later jobs from running. The command prints a final per-job summary and exits nonzero if any selected job failed.
+`backup --all` runs jobs sequentially in lexical job-name order. A failed job does not prevent later jobs from running. After lifecycle progress, the command prints one terminal-safe `<job>: succeeded` or `<job>: failed` line per result in execution order, followed by aggregate succeeded/failed counts. These outcome lines never include the underlying error text. The command exits nonzero if any selected job failed; a zero-job run prints only the zero-count aggregate.
 
 Interactive invocations print concise human-readable progress and errors to the terminal. Persistent operational details are written as JSON logs.
 
@@ -143,10 +143,11 @@ The default `validate` command checks:
 
 - YAML syntax, schema version, required fields, type correctness, and unknown fields.
 - Job name, database selection, cron expression, and conflicting option rules.
-- The configured cron user exists.
-- `mysqldump` is an absolute path to a regular executable file and responds successfully to `--version`.
+- Every selected configured user exists, including users of disabled jobs.
+- For every selected job, including a disabled job, `mysqldump` and the current ezdbbackup runtime are safe regular executables and respond successfully to `--version` under that job's `run_as` identity.
+- The pinned configuration source remains readable and safe for every selected job's `run_as` identity.
 - The temporary directory exists or can be created and is writable.
-- The log directory exists or can be created and is writable.
+- The log directory exists or can be created and is compatible with all selected `run_as` identities.
 - Referenced secret files exist, are regular readable files, and are not readable by users outside their owner or group.
 - The S3 endpoint, bucket, prefix, region, addressing mode, and explicit credential fields are structurally valid.
 - The executable and configuration paths can be represented safely in `/etc/cron.d/ezdbbackup`.
@@ -156,7 +157,7 @@ The default `validate` command checks:
 - Runs the configured dump executable in a non-mutating connection probe for each selected job, using the same connection and authentication path as a backup while requesting no table data or DDL and discarding stdout.
 - Makes a non-mutating S3 bucket access request through the configured endpoint and credential provider.
 
-Connectivity results identify MySQL and S3 separately. An S3 connectivity failure may reflect a policy that permits object upload but denies bucket inspection; the diagnostic must state that limitation rather than claiming the configuration can never upload.
+Connectivity validation first requires the process's complete credentials to match every selected job's `run_as`, using the same exact identity rule as backup execution. Any mismatch is an error and prevents every selected configured executable/version/connectivity probe and S3 client construction. Jobs with distinct `run_as` identities must therefore be validated in separate invocations, for example `sudo -u <run_as> ezdbbackup validate <job> --connectivity`. Connectivity results identify MySQL and S3 separately. An S3 connectivity failure may reflect a policy that permits object upload but denies bucket inspection; the diagnostic must state that limitation rather than claiming the configuration can never upload.
 
 ## Backup execution
 

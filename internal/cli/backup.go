@@ -174,11 +174,14 @@ func printValidationReport(report validation.Report, deps Dependencies) bool {
 func printBackupSummary(summary backup.Summary, deps Dependencies) {
 	succeeded, failed := 0, 0
 	for _, job := range summary.Results {
+		status := "succeeded"
 		if job.Err != nil {
 			failed++
-			continue
+			status = "failed"
+		} else {
+			succeeded++
 		}
-		succeeded++
+		fmt.Fprintf(deps.Stdout, "%s: %s\n", encoded(job.Job), status)
 	}
 	fmt.Fprintf(deps.Stdout, "backup summary: %d succeeded, %d failed\n", succeeded, failed)
 }

@@ -30,6 +30,7 @@ func Args(req Request) []string {
 
 func connectionArgs(req Request) []string {
 	return []string{
+		"--no-defaults",
 		"--host=" + req.Host,
 		"--port=" + strconv.Itoa(req.Port),
 		"--user=" + req.User,
@@ -49,11 +50,10 @@ func appendDatabaseScope(args []string, req Request) []string {
 func ProbeArgs(req Request) []string {
 	// Option files may contain dump behavior such as result-file, init-command,
 	// or replica controls, and some of those act while options are parsed. Keep
-	// the probe's policy enforceable by disabling ordinary option files before
-	// supplying owned connection fields. MySQL login-path files, where supported,
-	// are restricted by MySQL to connection and authentication settings.
-	args := []string{"--no-defaults"}
-	args = append(args, connectionArgs(req)...)
+	// backup and probe policy enforceable by sharing a baseline that disables
+	// ordinary option files before supplying owned connection fields. MySQL
+	// login-path files, where supported, remain available to the client.
+	args := connectionArgs(req)
 	for _, arg := range req.ExtraArgs {
 		if probeConnectionOption(arg) {
 			args = append(args, arg)
