@@ -31,11 +31,20 @@ The canonical company name in user-facing content is **EZ Game Host**. Lowercase
 
 ## Chosen approach and alternatives
 
-### Chosen: central publisher with a dispatching shared action
+### Chosen: central discovery with a release-asset shared action
 
-Application repositories create and verify their `.deb` files, attach them to a GitHub release, and invoke a shared action from `apt-repo-infra`. The action verifies the local packages and sends an authenticated `repository_dispatch` request containing immutable release asset references and SHA-256 digests. A workflow in `apt-repo-infra` downloads and verifies those assets, updates the APT repository, signs it, and uploads it to R2.
+Application repositories create and verify their `.deb` files and invoke the
+shared action after their GitHub release exists. The action idempotently attaches
+the verified packages to that release, obtains a short-lived GitHub OIDC token,
+and requests publication through an authenticated Worker broker. A serialized
+workflow in `apt-repo-infra` independently enumerates an allowlist of public EZ Game Host
+repositories and package names, downloads exact architecture pairs, binds each
+package version to its release tag, updates the APT repository, signs it, and
+uploads it to R2. A 15-minute schedule provides a fallback for missed triggers.
 
-This keeps privileged credentials in one repository and provides one serialized publication queue for every package.
+This keeps all privileged credentials and repository write authority in one
+repository, gives application workflows no cross-repository token, and provides
+one serialized publication queue for every package.
 
 ### Rejected: publish directly from every application repository
 
@@ -98,6 +107,7 @@ The public namespace will be:
 /
   index.html
   keys/ez-game-host-archive-keyring.asc
+  keys/ez-game-host-archive-keyring-<fingerprint>.asc
   apt/
     dists/stable/InRelease
     dists/stable/Release
@@ -129,26 +139,30 @@ The composite action accepts:
 - Release tag.
 - Newline-separated `.deb` paths.
 - The caller's GitHub token for release-asset upload.
-- A narrowly scoped infrastructure dispatch token.
 
 It performs these steps:
 
 1. Reject unsafe paths, malformed tags, unexpected file types, duplicate tuples, and packages outside the `ezgamehost` GitHub organization.
 2. Inspect each archive using Debian tooling and require a safe package name, Debian version, and supported architecture.
 3. Calculate SHA-256 and size.
-4. Upload each archive to the existing GitHub release without overwriting an existing asset.
+4. Upload each archive to the existing GitHub release without overwriting an existing asset; on retry, download an existing asset and require the exact size and SHA-256.
 5. Resolve the uploaded assets through the GitHub API and confirm their names and sizes.
-6. Dispatch a publication request to `ezgamehost/apt-repo-infra` containing only the source repository, tag, asset names, sizes, and digests.
 
-The action never receives the archive signing key or Cloudflare credentials. The cross-repository token will be a fine-grained credential limited to dispatching workflows in `apt-repo-infra`, stored as an organization or selected-repository Actions secret.
+The action never receives the archive signing key, Cloudflare credentials, or
+any credential for `apt-repo-infra`. Its GitHub token can write only the caller's
+release assets. The Worker validates the OIDC signature and exact repository,
+tag, event, workflow, issuer, audience, and lifetime claims before using its
+central dispatch credential; replayed tokens do not create another dispatch.
 
 ## Central publication workflow
 
-The infrastructure workflow runs under a repository-wide production concurrency group and does not cancel an in-progress publication. It:
+The infrastructure workflow runs on the authenticated dispatch, a fallback
+schedule, or an operator's main-branch manual request. It uses a repository-wide
+production concurrency group and does not cancel an in-progress publication. It:
 
-1. Validates the dispatch schema and allowlisted organization.
-2. Downloads public assets from the specified immutable GitHub release.
-3. Confirms size, SHA-256, Debian metadata, package filename, and architecture.
+1. Reads a reviewed allowlist of source repositories and package names.
+2. Enumerates non-draft, non-prerelease public releases and requires exact amd64/arm64 asset pairs.
+3. Downloads the assets and confirms size, SHA-256, Debian metadata, package filename, architecture, and version-to-tag binding.
 4. Fetches the current repository state from R2 into a clean temporary workspace.
 5. Rejects conflicting package tuples and installs new packages under immutable pool paths.
 6. Regenerates deterministic `Packages` and compressed indexes for both architectures.
@@ -195,7 +209,8 @@ The deployment workflow will use scoped Cloudflare account and zone credentials.
 - ASCII-armored archive private key.
 - Archive key passphrase.
 
-Application repositories require only the fine-grained infrastructure dispatch token in addition to their built-in GitHub token.
+Application repositories require only their built-in GitHub token with release
+asset write permission.
 
 Every workflow starts with `permissions: {}` and grants the minimum job-level permissions. Third-party Actions are pinned to immutable commit SHAs. Secrets are never accepted as command-line arguments, logged, embedded in artifacts, or exposed to pull-request workflows.
 
@@ -206,11 +221,11 @@ Infrastructure CI will include:
 - Worker unit tests covering GET, HEAD, ranges, cache headers, content types, missing objects, forbidden methods, path traversal, encoding edge cases, and terminal-safe errors.
 - Script tests with controlled Debian, GPG, GitHub, and R2 tools covering success and fail-closed behavior.
 - Repository fixture tests validating signatures, checksums, architectures, by-hash objects, idempotency, and conflict rejection.
-- Composite-action tests covering input validation, asset verification, non-overwrite behavior, digest binding, and dispatch payloads.
+- Composite-action tests covering input validation, asset verification, retry-safe non-overwrite behavior, and digest binding.
 - Shell syntax checks, actionlint, formatting, type checking, dependency audit, and Worker dry-run deployment.
 - An isolated Debian/Ubuntu container that installs the public key and source, runs `apt-get update`, installs the package, and verifies `ezdbbackup version`.
 
-The ezdbbackup workflow retains its unit, vet, race, static-build, LocalStack, checksum, and release gates. New `.deb` tests run before GitHub release or APT dispatch.
+The ezdbbackup workflow retains its unit, vet, race, static-build, LocalStack, checksum, and release gates. New `.deb` tests run before GitHub release publication and central discovery.
 
 ## Error handling and recovery
 

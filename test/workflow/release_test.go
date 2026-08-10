@@ -41,6 +41,7 @@ type job struct {
 
 type step struct {
 	Name            string         `yaml:"name"`
+	ID              string         `yaml:"id"`
 	Uses            string         `yaml:"uses"`
 	With            map[string]any `yaml:"with"`
 	Run             string         `yaml:"run"`
@@ -92,7 +93,7 @@ func (decoded *job) UnmarshalYAML(node *yaml.Node) error {
 }
 
 func (decoded *step) UnmarshalYAML(node *yaml.Node) error {
-	if err := requireOnlyMappingKeys(node, "release step", "name", "uses", "with", "run", "if", "continue-on-error", "env"); err != nil {
+	if err := requireOnlyMappingKeys(node, "release step", "name", "id", "uses", "with", "run", "if", "continue-on-error", "env"); err != nil {
 		return err
 	}
 	type plainStep step
@@ -185,7 +186,7 @@ func TestReleasePublishDependsOnEveryVerificationGate(t *testing.T) {
 	}
 
 	gates := []string{"unit", "vet", "race", "static-build", "integration"}
-	allJobs := append(append([]string(nil), gates...), "publish")
+	allJobs := append(append([]string(nil), gates...), "publish", "apt-publish")
 	jobNames := make([]string, 0, len(release.Jobs))
 	for name := range release.Jobs {
 		jobNames = append(jobNames, name)
@@ -214,6 +215,56 @@ func TestReleasePublishDependsOnEveryVerificationGate(t *testing.T) {
 	if len(publish.Steps) != 3 {
 		t.Fatalf("publish steps = %d, want download, checksum, and publish only", len(publish.Steps))
 	}
+}
+
+func TestReleasePublishesExactlyTwoDebianPackagesToPinnedAptAction(t *testing.T) {
+	release := loadReleaseWorkflow(t)
+	aptPublish, ok := release.Jobs["apt-publish"]
+	if !ok {
+		t.Fatal("release workflow has no apt-publish job")
+	}
+	if aptPublish.RunsOn != "ubuntu-latest" || aptPublish.TimeoutMinutes != 10 {
+		t.Fatalf("apt-publish runner/timeout = %q/%d, want ubuntu-latest/10", aptPublish.RunsOn, aptPublish.TimeoutMinutes)
+	}
+	if !reflect.DeepEqual(aptPublish.Permissions, map[string]string{"contents": "write", "id-token": "write"}) {
+		t.Fatalf("apt-publish permissions = %v, want contents/id-token write", aptPublish.Permissions)
+	}
+	assertJobCannotIgnoreFailures(t, "apt-publish", aptPublish)
+	assertExactStrings(t, "apt-publish.needs", []string(aptPublish.Needs), []string{"publish"})
+	if len(aptPublish.Environment) != 0 {
+		t.Fatalf("apt-publish has unapproved job environment: %v", aptPublish.Environment)
+	}
+
+	const resolvePackages = `set -euo pipefail
+version="${GITHUB_REF_NAME#v}"
+[[ "${version}" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]
+amd64="dist/ezdbbackup_${version}_amd64.deb"
+arm64="dist/ezdbbackup_${version}_arm64.deb"
+[[ -f "${amd64}" && ! -L "${amd64}" ]]
+[[ -f "${arm64}" && ! -L "${arm64}" ]]
+{
+  echo 'files<<EZDBBACKUP_PACKAGES'
+  printf '%s\n' "${amd64}" "${arm64}"
+  echo 'EZDBBACKUP_PACKAGES'
+} >>"${GITHUB_OUTPUT}"`
+	const actionSHA = "f15cb00f0e62d7ac70464b05804ab8d7267f0fb7"
+	assertExactSteps(t, "apt-publish", aptPublish, []step{
+		{
+			Name: "Download verified release artifacts", Uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+			With: map[string]any{"name": "release-dist", "path": "dist"},
+		},
+		{Name: "Verify packaged checksums", Run: "cd dist && sha256sum -c SHA256SUMS"},
+		{Name: "Resolve Debian package paths", ID: "packages", Run: resolvePackages},
+		{
+			Name: "Publish Debian packages to the EZ Game Host APT repository",
+			Uses: "ezgamehost/apt-repo-infra/.github/actions/publish@" + actionSHA,
+			With: map[string]any{
+				"release-tag":   "${{ github.ref_name }}",
+				"package-files": "${{ steps.packages.outputs.files }}",
+				"github-token":  "${{ github.token }}",
+			},
+		},
+	})
 }
 
 func TestReleaseVerificationJobsExerciseRequiredBoundaries(t *testing.T) {
@@ -260,13 +311,17 @@ func TestReleaseVerificationJobsExerciseRequiredBoundaries(t *testing.T) {
 
 	build := release.Jobs["static-build"]
 	assertExactRun(t, build, "Build, inspect, and package static Linux binaries", "bash scripts/package-release.sh")
-	findUses(t, build, "actions/upload-artifact@v4")
+	findUses(t, build, "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
 
 	publish := release.Jobs["publish"]
-	findUses(t, publish, "actions/download-artifact@v4")
+	findUses(t, publish, "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093")
 	assertExactRun(t, publish, "Verify packaged checksums", "cd dist && sha256sum -c SHA256SUMS")
 	publishStep := findStep(t, publish, "Publish GitHub release")
-	if strings.TrimSpace(publishStep.Run) != `gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes` {
+	if strings.TrimSpace(publishStep.Run) != `gh release create "$GITHUB_REF_NAME" \
+  dist/SHA256SUMS \
+  "dist/ezdbbackup_${GITHUB_REF_NAME}_linux_amd64.tar.gz" \
+  "dist/ezdbbackup_${GITHUB_REF_NAME}_linux_arm64.tar.gz" \
+  --verify-tag --generate-notes` {
 		t.Fatalf("publish command = %q", publishStep.Run)
 	}
 
@@ -293,8 +348,8 @@ func TestReleaseVerificationJobsExerciseRequiredBoundaries(t *testing.T) {
 		t.Fatalf("LocalStack healthcheck = %#v, want %#v", health, wantHealth)
 	}
 
-	setupGo := step{Uses: "actions/setup-go@v5", With: map[string]any{"go-version-file": "go.mod"}}
-	checkout := step{Uses: "actions/checkout@v4"}
+	setupGo := step{Uses: "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff", With: map[string]any{"go-version-file": "go.mod"}}
+	checkout := step{Uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"}
 	assertExactSteps(t, "unit", release.Jobs["unit"], []step{
 		checkout,
 		setupGo,
@@ -315,7 +370,7 @@ func TestReleaseVerificationJobsExerciseRequiredBoundaries(t *testing.T) {
 		setupGo,
 		{Name: "Build, inspect, and package static Linux binaries", Run: "bash scripts/package-release.sh"},
 		{
-			Name: "Upload verified release artifacts", Uses: "actions/upload-artifact@v4",
+			Name: "Upload verified release artifacts", Uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
 			With: map[string]any{
 				"name": "release-dist", "path": "dist/", "if-no-files-found": "error",
 				"retention-days": 1, "compression-level": 0,
@@ -332,12 +387,16 @@ func TestReleaseVerificationJobsExerciseRequiredBoundaries(t *testing.T) {
 	})
 	assertExactSteps(t, "publish", publish, []step{
 		{
-			Name: "Download verified release artifacts", Uses: "actions/download-artifact@v4",
+			Name: "Download verified release artifacts", Uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
 			With: map[string]any{"name": "release-dist", "path": "dist"},
 		},
 		{Name: "Verify packaged checksums", Run: "cd dist && sha256sum -c SHA256SUMS"},
 		{
-			Name: "Publish GitHub release", Run: `gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes`,
+			Name: "Publish GitHub release", Run: `gh release create "$GITHUB_REF_NAME" \
+  dist/SHA256SUMS \
+  "dist/ezdbbackup_${GITHUB_REF_NAME}_linux_amd64.tar.gz" \
+  "dist/ezdbbackup_${GITHUB_REF_NAME}_linux_arm64.tar.gz" \
+  --verify-tag --generate-notes`,
 			Environment: map[string]any{
 				"GH_TOKEN": "${{ github.token }}", "GH_REPO": "${{ github.repository }}",
 			},

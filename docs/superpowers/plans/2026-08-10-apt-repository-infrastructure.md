@@ -4,7 +4,7 @@
 
 **Goal:** Build, deploy, and verify a centralized signed APT repository at packages.ezghcloud.com, then publish ezdbbackup through a reusable action owned by ezgamehost/apt-repo-infra.
 
-**Architecture:** A public infrastructure repository owns a private-R2-backed Cloudflare Worker, deterministic APT metadata generation, signing, serialized publication, and a composite dispatch action. Application repositories build verified Debian packages and request central publication by immutable GitHub release reference, keeping Cloudflare and signing credentials out of callers.
+**Architecture:** A public infrastructure repository owns a private-R2-backed Cloudflare Worker, authenticated GitHub OIDC publication broker, deterministic APT metadata generation, signing, serialized publication, central allowlisted release discovery, and a composite release-asset action. Application repositories build verified Debian packages and attach them to immutable GitHub releases; the broker requests immediate central discovery without distributing Cloudflare, signing, or cross-repository credentials, and scheduled discovery remains a fallback.
 
 **Tech Stack:** Cloudflare Workers and R2, TypeScript, Vitest/Miniflare, Bash, Debian package tools, GnuPG, GitHub Actions, Wrangler, and Go workflow tests.
 
@@ -142,7 +142,7 @@ Upload explicit files rather than a broad sync. Set immutable cache control only
 
 ---
 
-### Task 4: Add the reusable dispatch action and workflows
+### Task 4: Add the reusable release-asset action and central workflows
 
 **Files:**
 - Create: .github/actions/publish/action.yml, .github/actions/publish/publish.sh
@@ -153,13 +153,13 @@ Upload explicit files rather than a broad sync. Set immutable cache control only
 - Modify: scripts/check.sh, README.md
 
 **Interfaces:**
-- Action consumes release tag, newline-separated package paths, caller GitHub token, and infrastructure dispatch token.
-- Action produces verified release assets and payload with source repository, release tag, asset name, size, and SHA-256.
-- Central workflow consumes apt-package-publish and produces one serialized signed R2 publication.
+- Action consumes release tag, newline-separated package paths, and the caller GitHub token.
+- Action produces verified, retry-safe release assets and uses a short-lived GitHub OIDC identity to request publication without cross-repository authority.
+- Worker validates exact OIDC repository/tag/workflow claims and brokers the central dispatch; central workflow also polls reviewed repository/package allowlists as a fallback and produces one serialized signed R2 publication.
 
 - [ ] **Step 1: Write and run RED action tests**
 
-Use fake dpkg-deb, sha256sum, and gh executables with structured argv logs. Cover empty input, unsafe tags, glob injection, newline/control bytes, symlinks, unsupported architectures, duplicates, existing assets, callers outside ezgamehost, upload failure, asset re-resolution mismatch, dispatch failure, and secret redaction.
+Use fake dpkg-deb, sha256sum, and gh executables with structured argv logs. Cover empty input, unsafe tags, glob injection, newline/control bytes, symlinks, unsupported architectures, duplicates, matching and conflicting existing assets, callers outside ezgamehost, upload failure, asset re-resolution mismatch, and secret redaction.
 
     bash test/publish_action_test.sh
 
@@ -167,7 +167,7 @@ Expected: FAIL because the action is absent.
 
 - [ ] **Step 2: Implement the composite action**
 
-Pass tokens through environment only. Parse newline-delimited paths without eval, validate each regular file and Debian tuple, upload without overwrite, resolve each asset again, and build JSON only with jq typed arguments. Dispatch apt-package-publish to ezgamehost/apt-repo-infra only after every asset is verified.
+Pass the caller token through the environment only. Parse newline-delimited paths without eval, validate each regular file and Debian tuple, upload without overwrite, accept retries only after downloading and digesting the existing asset, resolve each asset again, then exchange the job's OIDC request credential for a short-lived token and call the authenticated Worker broker.
 
 - [ ] **Step 3: Write and run RED workflow-policy tests**
 
@@ -175,7 +175,7 @@ Require exact triggers, empty default permissions, bounded timeouts, production 
 
 - [ ] **Step 4: Implement CI, deployment, publication, and rebuild**
 
-CI runs npm, TypeScript, Worker, shell, ShellCheck, and actionlint checks. Deployment idempotently creates the R2 bucket, disables public r2.dev, and deploys the custom domain. Publication validates payload before download, verifies release redirect host, size, digest, and package metadata, imports the exact signing fingerprint into a temporary keyring, fetches current R2 state, publishes, and runs smoke tests. Rebuild regenerates metadata only from retained pool packages.
+CI runs npm, TypeScript, Worker, shell, ShellCheck, actionlint, and dependency-audit checks. Deployment idempotently creates the R2 bucket, disables public r2.dev, and deploys the custom domain. Publication enumerates only reviewed repository/package sources, requires exact architecture pairs, binds package versions to release tags, verifies size, digest, and package metadata, imports the exact signing fingerprint into a temporary keyring, fetches and validates current R2 state, publishes, and runs a clean-client smoke test. Rebuild regenerates metadata only from validated canonical retained pool packages.
 
 - [ ] **Step 5: Verify GREEN, commit, and tag**
 
@@ -236,12 +236,12 @@ Create a mode-0700 temporary package root, install the binary at usr/bin/ezdbbac
 - Modify: .github/workflows/release.yml, test/workflow/release_test.go, README.md
 
 **Interfaces:**
-- Consumes: immutable shared-action SHA, dist Debian packages, GitHub token, and APT_REPOSITORY_DISPATCH_TOKEN.
-- Produces: release package assets and a central publication dispatch only after every existing gate.
+- Consumes: immutable shared-action SHA, dist Debian packages, and GitHub token.
+- Produces: release package assets discoverable by the central allowlisted publisher only after every existing gate.
 
 - [ ] **Step 1: Write and run RED workflow tests**
 
-Require GitHub release publication to include checksummed Debian packages. Require an apt-publish job that needs publish, has bounded permissions and timeout, invokes the shared action by full commit SHA, passes exactly two package paths, and obtains the dispatch credential only from the named secret.
+Require GitHub release publication to include checksummed Debian packages. Require an apt-publish job that needs publish, has bounded permissions and timeout, invokes the shared action by full commit SHA, and passes exactly two package paths with only the built-in release-write token.
 
     go test ./test/workflow -run TestRelease -count=1
 
@@ -249,7 +249,7 @@ Expected: FAIL because the job is absent.
 
 - [ ] **Step 2: Add the shared-action job**
 
-Download the verified artifact, check SHA256SUMS, derive the package version in an audited shell step, and invoke the pinned action. The action uploads Debian assets to the existing release and dispatches central publication.
+Download the verified artifact, check SHA256SUMS, derive the package version in an audited shell step, and invoke the pinned action. The action uploads Debian assets to the existing release; the central scheduled publisher discovers the allowlisted exact pair independently.
 
 - [ ] **Step 3: Run the complete matrix and commit**
 
@@ -282,7 +282,7 @@ Use a temporary mode-0700 GNUPGHOME to generate a passphrase-protected RSA-4096 
 
 - [ ] **Step 2: Configure production credentials**
 
-Create protected environment packages-production; set Cloudflare account, zone, and scoped token secrets there. Set the narrowly scoped infrastructure-dispatch credential for ezdbbackup. Verify configuration through GitHub metadata APIs without reading values.
+Create protected environment packages-production; set Cloudflare account, zone, R2 object, and signing secrets there. Add the central reviewed source allowlist; do not create a cross-repository credential for ezdbbackup. Verify configuration through GitHub metadata APIs without reading values.
 
 - [ ] **Step 3: Deploy and publish an empty repository**
 

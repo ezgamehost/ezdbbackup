@@ -16,6 +16,7 @@ const (
 	packageCallLogEnv    = "EZDBBACKUP_RELEASE_CALL_LOG"
 	packageFailToolEnv   = "EZDBBACKUP_RELEASE_FAIL_TOOL"
 	packageRealSHAEnv    = "EZDBBACKUP_RELEASE_REAL_SHA256SUM"
+	packageRealDpkgEnv   = "EZDBBACKUP_RELEASE_REAL_DPKG_DEB"
 )
 
 func TestMain(m *testing.M) {
@@ -34,6 +35,8 @@ func TestPackageReleaseBuildsAndInspectsBothArchitectures(t *testing.T) {
 
 	wantFiles := []string{
 		"SHA256SUMS",
+		"ezdbbackup_9.8.7-test_amd64.deb",
+		"ezdbbackup_9.8.7-test_arm64.deb",
 		"ezdbbackup_v9.8.7-test_linux_amd64.tar.gz",
 		"ezdbbackup_v9.8.7-test_linux_arm64.tar.gz",
 	}
@@ -50,7 +53,11 @@ func TestPackageReleaseBuildsAndInspectsBothArchitectures(t *testing.T) {
 		t.Fatalf("release files = %v, want %v", gotFiles, wantFiles)
 	}
 
-	for _, archive := range wantFiles[1:] {
+	archives := []string{
+		"ezdbbackup_v9.8.7-test_linux_amd64.tar.gz",
+		"ezdbbackup_v9.8.7-test_linux_arm64.tar.gz",
+	}
+	for _, archive := range archives {
 		command := exec.Command("tar", "-tzf", filepath.Join(fixture.dist, archive))
 		contents, err := command.Output()
 		if err != nil {
@@ -72,6 +79,10 @@ func TestPackageReleaseBuildsAndInspectsBothArchitectures(t *testing.T) {
 		if got, want := string(binary), fakeReleaseBinaryContents(arch); got != want {
 			t.Errorf("%s binary was not the exact %s go build output", archive, arch)
 		}
+	}
+
+	for _, arch := range []string{"amd64", "arm64"} {
+		inspectDebianPackage(t, filepath.Join(fixture.dist, "ezdbbackup_9.8.7-test_"+arch+".deb"), arch)
 	}
 
 	checksum := exec.Command(fixture.realSHA, "-c", "SHA256SUMS")
@@ -100,6 +111,88 @@ func TestPackageReleaseBuildsAndInspectsBothArchitectures(t *testing.T) {
 	assertPackageScratchEmpty(t, fixture.scratch)
 }
 
+func inspectDebianPackage(t *testing.T, path, architecture string) {
+	t.Helper()
+	wantFields := map[string]string{
+		"Package":      "ezdbbackup",
+		"Version":      "9.8.7-test",
+		"Architecture": architecture,
+		"Maintainer":   "EZ Game Host Support <support@ezgamehost.com>",
+		"Section":      "admin",
+		"Priority":     "optional",
+		"Depends":      "ca-certificates",
+		"Recommends":   "default-mysql-client, cron",
+		"Homepage":     "https://github.com/ezgamehost/ezdbbackup",
+	}
+	for field, want := range wantFields {
+		command := exec.Command("dpkg-deb", "-f", path, field)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("read %s from %s: %v\n%s", field, path, err, output)
+		}
+		if got := strings.TrimSpace(string(output)); got != want {
+			t.Errorf("%s %s = %q, want %q", filepath.Base(path), field, got, want)
+		}
+	}
+
+	contentsCommand := exec.Command("dpkg-deb", "--contents", path)
+	contents, err := contentsCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("inspect %s contents: %v\n%s", path, err, contents)
+	}
+	listing := string(contents)
+	for _, required := range []string{
+		"root/root", "./usr/bin/ezdbbackup", "./usr/share/doc/ezdbbackup/README.md",
+		"./usr/share/doc/ezdbbackup/examples/config.yml", "./usr/share/doc/ezdbbackup/copyright",
+		"./usr/share/doc/ezdbbackup/changelog.gz",
+	} {
+		if !strings.Contains(listing, required) {
+			t.Errorf("%s contents do not contain %q:\n%s", filepath.Base(path), required, listing)
+		}
+	}
+	if !strings.Contains(listing, "-rwxr-xr-x root/root") || !strings.Contains(listing, "./usr/bin/ezdbbackup") {
+		t.Errorf("%s binary is not root-owned mode 0755:\n%s", filepath.Base(path), listing)
+	}
+	for _, document := range []string{
+		"./usr/share/doc/ezdbbackup/README.md",
+		"./usr/share/doc/ezdbbackup/examples/config.yml",
+		"./usr/share/doc/ezdbbackup/copyright",
+		"./usr/share/doc/ezdbbackup/changelog.gz",
+	} {
+		if !listingHasMode(listing, document, "-rw-r--r--", "root/root") {
+			t.Errorf("%s document %s is not root-owned mode 0644:\n%s", filepath.Base(path), document, listing)
+		}
+	}
+	for _, forbidden := range []string{"./etc/", "./var/log/", "./var/spool/cron/", ".my.cnf"} {
+		if strings.Contains(listing, forbidden) {
+			t.Errorf("%s unexpectedly contains %q:\n%s", filepath.Base(path), forbidden, listing)
+		}
+	}
+
+	extractRoot := t.TempDir()
+	extract := exec.Command("dpkg-deb", "--extract", path, extractRoot)
+	if output, err := extract.CombinedOutput(); err != nil {
+		t.Fatalf("extract %s: %v\n%s", path, err, output)
+	}
+	binary, err := os.ReadFile(filepath.Join(extractRoot, "usr", "bin", "ezdbbackup"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(binary), fakeReleaseBinaryContents(architecture); got != want {
+		t.Errorf("%s package binary differs from exact verified build output", architecture)
+	}
+}
+
+func listingHasMode(listing, path, mode, owner string) bool {
+	for _, line := range strings.Split(listing, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 6 && fields[0] == mode && fields[1] == owner && fields[len(fields)-1] == path {
+			return true
+		}
+	}
+	return false
+}
+
 func TestPackageReleaseFailsClosedWhenVerificationFails(t *testing.T) {
 	tests := []struct {
 		name string
@@ -112,6 +205,12 @@ func TestPackageReleaseFailsClosedWhenVerificationFails(t *testing.T) {
 		{name: "static linkage", fail: "linkage", want: "not a static amd64 Linux ELF executable"},
 		{name: "dynamic dependency", fail: "ldd", want: "dynamic dependency reported"},
 		{name: "version", fail: "version", want: "reports unexpected version"},
+		{name: "debian build", fail: "deb-build", want: "fake dpkg-deb build failure"},
+		{name: "debian metadata", fail: "deb-metadata", want: "package Architecture field"},
+		{name: "debian contents", fail: "deb-contents", want: "package contents do not match required manifest"},
+		{name: "debian ownership and mode", fail: "deb-owner-mode", want: "package contents do not match required manifest"},
+		{name: "debian maintainer script", fail: "deb-control", want: "package control archive contains unexpected files"},
+		{name: "debian embedded binary", fail: "deb-binary", want: "package binary differs from verified build"},
 		{name: "checksum", fail: "checksum", want: "fake checksum verification failure"},
 	}
 	for _, test := range tests {
@@ -154,7 +253,7 @@ func newPackageFixture(t *testing.T, fail string) packageFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tool := range []string{"go", "file", "ldd", "sha256sum"} {
+	for _, tool := range []string{"go", "file", "ldd", "sha256sum", "dpkg-deb"} {
 		if err := os.Symlink(testBinary, filepath.Join(fakeBin, tool)); err != nil {
 			t.Fatal(err)
 		}
@@ -187,6 +286,7 @@ func (fixture packageFixture) run(t *testing.T) (string, error) {
 		packageCallLogEnv:             fixture.callLog,
 		packageFailToolEnv:            fixture.fail,
 		packageRealSHAEnv:             fixture.realSHA,
+		packageRealDpkgEnv:            mustLookPath(t, "dpkg-deb"),
 	})
 	output, err := command.CombinedOutput()
 	return string(output), err
@@ -297,12 +397,14 @@ func assertPackageCalls(t *testing.T, records []packageCall) {
 	if hasExactPackageCall(records, "version", []string{builds["arm64"], "version"}) {
 		t.Error("arm64 cross-compiled binary was unexpectedly executed")
 	}
-	wantArchives := []string{
+	wantArtifacts := []string{
+		"ezdbbackup_9.8.7-test_amd64.deb",
+		"ezdbbackup_9.8.7-test_arm64.deb",
 		"ezdbbackup_v9.8.7-test_linux_amd64.tar.gz",
 		"ezdbbackup_v9.8.7-test_linux_arm64.tar.gz",
 	}
-	if !hasExactPackageCall(records, "sha256sum", wantArchives) {
-		t.Errorf("sha256 generation did not cover exact archives %v", wantArchives)
+	if !hasExactPackageCall(records, "sha256sum", wantArtifacts) {
+		t.Errorf("sha256 generation did not cover exact artifacts %v", wantArtifacts)
 	}
 	if !hasExactPackageCall(records, "sha256sum", []string{"-c", "SHA256SUMS"}) {
 		t.Error("generated SHA256SUMS was not verified")
@@ -410,10 +512,81 @@ func runPackageToolHelper() int {
 			return 127
 		}
 		return 0
+	case "dpkg-deb":
+		return runFakeDpkgDeb()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown fake package tool %q\n", tool)
 		return 127
 	}
+}
+
+func runFakeDpkgDeb() int {
+	realTool := os.Getenv(packageRealDpkgEnv)
+	arguments := os.Args[1:]
+	failure := os.Getenv(packageFailToolEnv)
+	if failure == "deb-build" && containsString(arguments, "--build") {
+		fmt.Fprintln(os.Stderr, "fake dpkg-deb build failure")
+		return 1
+	}
+	if failure == "deb-metadata" && len(arguments) >= 3 && arguments[0] == "-f" && arguments[2] == "Architecture" {
+		fmt.Println("all")
+		return 0
+	}
+
+	command := exec.Command(realTool, arguments...)
+	command.Stdin = os.Stdin
+	if (failure == "deb-contents" || failure == "deb-owner-mode") && containsString(arguments, "--contents") {
+		output, err := command.CombinedOutput()
+		if err != nil {
+			fmt.Fprint(os.Stderr, string(output))
+			return exitCode(err)
+		}
+		listing := string(output)
+		if failure == "deb-contents" {
+			listing += "-rw-r--r-- root/root 0 2026-01-01 00:00 ./etc/unsafe\n"
+		} else {
+			listing = strings.Replace(listing, "-rwxr-xr-x root/root", "-rwxrwxrwx 1000/1000", 1)
+		}
+		fmt.Print(listing)
+		return 0
+	}
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	if err := command.Run(); err != nil {
+		return exitCode(err)
+	}
+	if failure == "deb-binary" && containsString(arguments, "--extract") {
+		extractRoot := arguments[len(arguments)-1]
+		if err := os.WriteFile(filepath.Join(extractRoot, "usr", "bin", "ezdbbackup"), []byte("tampered\n"), 0o755); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	if failure == "deb-control" && containsString(arguments, "--control") {
+		controlRoot := arguments[len(arguments)-1]
+		if err := os.WriteFile(filepath.Join(controlRoot, "postinst"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	return 0
+}
+
+func exitCode(err error) int {
+	if exit, ok := err.(*exec.ExitError); ok {
+		return exit.ExitCode()
+	}
+	fmt.Fprintln(os.Stderr, err)
+	return 127
+}
+
+func mustLookPath(t *testing.T, name string) string {
+	t.Helper()
+	path, err := exec.LookPath(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func appendPackageCall(tool string, args []string) error {

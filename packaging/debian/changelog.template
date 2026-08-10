@@ -1,0 +1,5 @@
+ezdbbackup (@VERSION@) stable; urgency=medium
+
+  * Release @VERSION@.
+
+ -- EZ Game Host Support <support@ezgamehost.com>  @DATE@
