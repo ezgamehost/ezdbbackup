@@ -3,6 +3,7 @@ package validation
 import (
 	"context"
 	"fmt"
+	"os/user"
 	"sort"
 	"strings"
 
@@ -24,13 +25,33 @@ type Checker interface {
 	Check(context.Context, *config.Config, []string, Options) Report
 }
 
+// CurrentUserProvider supplies the invoking user identity for connectivity
+// diagnostics.
+type CurrentUserProvider interface {
+	CurrentUsername() (string, error)
+}
+
+// OSCurrentUser reads the user identity of the process invoking validation.
+type OSCurrentUser struct{}
+
+func (OSCurrentUser) CurrentUsername() (string, error) {
+	current, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("lookup invoking user: %w", err)
+	}
+	return current.Username, nil
+}
+
 // Validator coordinates pure configuration checks, local environment checks,
-// and optional read-only connectivity probes.
+// and optional read-only connectivity probes. In v1, executable version checks
+// and connectivity probes run as the invoking process; Validator does not
+// impersonate a job's configured run_as user.
 type Validator struct {
 	Environment Environment
 	Resolve     jobresolve.OptionsResolver
 	Dump        dump.Runner
 	Stores      storage.Factory
+	CurrentUser CurrentUserProvider
 }
 
 func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []string, options Options) Report {
@@ -103,11 +124,41 @@ func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []str
 
 	}
 	if options.Connectivity {
+		currentUser := v.CurrentUser
+		if currentUser == nil {
+			currentUser = OSCurrentUser{}
+		}
+		invokingUser, currentUserErr := currentUser.CurrentUsername()
 		for _, name := range names {
-			report = v.checkConnectivity(ctx, report, name, cfg.Jobs[name], *prerequisites[name])
+			job := cfg.Jobs[name]
+			if currentUserErr != nil {
+				report = report.Append(Finding{
+					Severity: SeverityWarning,
+					Job:      name,
+					Check:    "connectivity_identity",
+					Message:  fmt.Sprintf("could not determine invoking user: %v; connectivity probes still use the invoking process, not configured run_as user %q", currentUserErr, job.RunAs),
+				})
+			} else if invokingUser != job.RunAs {
+				report = report.Append(connectivityIdentityWarning(name, invokingUser, job.RunAs))
+			}
+			report = v.checkConnectivity(ctx, report, name, job, *prerequisites[name])
 		}
 	}
 	return report
+}
+
+func connectivityIdentityWarning(job, invokingUser, runAs string) Finding {
+	return Finding{
+		Severity: SeverityWarning,
+		Job:      job,
+		Check:    "connectivity_identity",
+		Message: fmt.Sprintf(
+			"connectivity probes use invoking user %q, not configured run_as user %q; to test with the scheduled-job identity, run `sudo -u %s ezdbbackup validate --connectivity`",
+			invokingUser,
+			runAs,
+			runAs,
+		),
+	}
 }
 
 func checkExecutable(ctx context.Context, environment Environment, path, runAs string) error {

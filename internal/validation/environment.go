@@ -28,7 +28,8 @@ type runAsExecutableEnvironment interface {
 
 // OSEnvironment checks the host filesystem and user database. Permission
 // decisions are based on the intended user's IDs and file metadata, rather
-// than the privileges of the validating process.
+// than the privileges of the validating process. These are point-in-time
+// validation checks; later execution is not atomic with validation.
 type OSEnvironment struct{}
 
 func (OSEnvironment) CheckUser(name string) error {
@@ -53,6 +54,9 @@ func (e OSEnvironment) CheckExecutable(ctx context.Context, path string) error {
 func (OSEnvironment) CheckExecutableAs(ctx context.Context, path, runAs string) error {
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("executable path %q must be absolute", path)
+	}
+	if err := rejectSymlinkComponents(path); err != nil {
+		return fmt.Errorf("executable path %q is unsafe: %w", path, err)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -80,6 +84,9 @@ func (OSEnvironment) CheckExecutableAs(ctx context.Context, path, runAs string) 
 func (OSEnvironment) CheckWritableTarget(path, runAs string) error {
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("target path %q must be absolute", path)
+	}
+	if err := rejectSymlinkComponents(path); err != nil {
+		return fmt.Errorf("writable target path %q is unsafe: %w", path, err)
 	}
 	identity, err := lookupIdentity(runAs)
 	if err != nil {
@@ -121,6 +128,9 @@ func (OSEnvironment) CheckSecretFile(path, runAs string) error {
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("secret file path %q must be absolute", path)
 	}
+	if err := rejectSymlinkComponents(path); err != nil {
+		return fmt.Errorf("secret file path %q is unsafe: %w", path, err)
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("stat secret file %q: %w", path, err)
@@ -150,6 +160,31 @@ func (OSEnvironment) CheckCronPath(path string) error {
 	}
 	if strings.ContainsAny(path, "\n\x00") {
 		return fmt.Errorf("cron path %q must not contain a newline or NUL", path)
+	}
+	return nil
+}
+
+func rejectSymlinkComponents(path string) error {
+	clean := filepath.Clean(path)
+	if path != clean {
+		return fmt.Errorf("path %q must be a clean absolute path", path)
+	}
+	current := string(filepath.Separator)
+	for _, component := range strings.Split(strings.TrimPrefix(clean, current), current) {
+		if component == "" {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inspect path component %q: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("path component %q is a symbolic link", current)
+		}
 	}
 	return nil
 }

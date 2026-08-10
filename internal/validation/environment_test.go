@@ -88,6 +88,108 @@ func TestOSEnvironmentExecutableUsesIntendedUserPermissions(t *testing.T) {
 	}
 }
 
+func TestOSEnvironmentRejectsSymlinkTargets(t *testing.T) {
+	requireLinux(t)
+	runAs := currentUsername(t)
+	env := OSEnvironment{}
+	dir := t.TempDir()
+
+	executableTarget := filepath.Join(dir, "real-mysqldump")
+	writeExecutable(t, executableTarget, "#!/bin/sh\nexit 0\n")
+	executableLink := filepath.Join(dir, "mysqldump")
+	if err := os.Symlink(executableTarget, executableLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.CheckExecutableAs(context.Background(), executableLink, runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("CheckExecutableAs(symlink) error = %v, want symbolic-link error", err)
+	}
+
+	secretTarget := filepath.Join(dir, "real-secret")
+	if err := os.WriteFile(secretTarget, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secretLink := filepath.Join(dir, "secret")
+	if err := os.Symlink(secretTarget, secretLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.CheckSecretFile(secretLink, runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("CheckSecretFile(symlink) error = %v, want symbolic-link error", err)
+	}
+
+	directoryTarget := t.TempDir()
+	directoryLink := filepath.Join(dir, "writable")
+	if err := os.Symlink(directoryTarget, directoryLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.CheckWritableTarget(directoryLink, runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("CheckWritableTarget(symlink) error = %v, want symbolic-link error", err)
+	}
+}
+
+func TestOSEnvironmentRejectsSymlinkedParentComponents(t *testing.T) {
+	requireLinux(t)
+	runAs := currentUsername(t)
+	env := OSEnvironment{}
+	root := t.TempDir()
+	realParent := filepath.Join(root, "real-parent")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkedParent := filepath.Join(root, "linked-parent")
+	if err := os.Symlink(realParent, linkedParent); err != nil {
+		t.Fatal(err)
+	}
+
+	executable := filepath.Join(realParent, "mysqldump")
+	writeExecutable(t, executable, "#!/bin/sh\nexit 0\n")
+	if err := env.CheckExecutableAs(context.Background(), filepath.Join(linkedParent, "mysqldump"), runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("CheckExecutableAs(symlinked parent) error = %v, want symbolic-link error", err)
+	}
+
+	secret := filepath.Join(realParent, "secret")
+	if err := os.WriteFile(secret, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.CheckSecretFile(filepath.Join(linkedParent, "secret"), runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("CheckSecretFile(symlinked parent) error = %v, want symbolic-link error", err)
+	}
+
+	existingDirectory := filepath.Join(realParent, "existing")
+	if err := os.Mkdir(existingDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.CheckWritableTarget(filepath.Join(linkedParent, "existing"), runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("CheckWritableTarget(existing under symlinked parent) error = %v, want symbolic-link error", err)
+	}
+
+	if err := env.CheckWritableTarget(filepath.Join(linkedParent, "missing", "target"), runAs); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("CheckWritableTarget(missing under symlinked parent) error = %v, want symbolic-link error", err)
+	}
+}
+
+func TestOSEnvironmentRejectsSymlinkBeforeDotDotComponent(t *testing.T) {
+	requireLinux(t)
+	runAs := currentUsername(t)
+	root := t.TempDir()
+	realParent := filepath.Join(root, "real-parent")
+	child := filepath.Join(realParent, "child")
+	if err := os.MkdirAll(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	executable := filepath.Join(realParent, "mysqldump")
+	writeExecutable(t, executable, "#!/bin/sh\nexit 0\n")
+	linkedParent := filepath.Join(root, "linked-parent")
+	if err := os.Symlink(child, linkedParent); err != nil {
+		t.Fatal(err)
+	}
+
+	path := linkedParent + string(filepath.Separator) + ".." + string(filepath.Separator) + "mysqldump"
+	err := (OSEnvironment{}).CheckExecutableAs(context.Background(), path, runAs)
+	if err == nil || !strings.Contains(err.Error(), "clean absolute path") {
+		t.Fatalf("CheckExecutableAs(symlink/..) error = %v, want clean-path error", err)
+	}
+}
+
 func TestOSEnvironmentRequiresIntendedUserToTraverseExecutablePath(t *testing.T) {
 	requireLinux(t)
 	other := lookupDifferentUser(t)

@@ -137,6 +137,97 @@ func TestValidatorConnectivityChecksMySQLAndS3SeparatelyAndContinues(t *testing.
 	}
 }
 
+func TestValidatorConnectivityWarnsWhenInvokingUserDiffersAndStillProbes(t *testing.T) {
+	tests := []struct {
+		name     string
+		ambient  bool
+		jobNames []string
+	}{
+		{name: "explicit credentials", jobNames: []string{"zulu", "alpha"}},
+		{name: "ambient credentials", ambient: true, jobNames: []string{"zulu", "alpha"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validValidationConfig()
+			for _, name := range []string{"zulu", "alpha"} {
+				job := validValidationJob(name, true)
+				if tt.ambient {
+					job.MySQL.PasswordFile = ""
+					job.S3.AccessKeyIDFile = ""
+					job.S3.SecretAccessKeyFile = ""
+					job.S3.SessionTokenFile = ""
+				}
+				cfg.Jobs[name] = job
+			}
+			remote := &fakeRemoteDependencies{}
+			current := &fakeCurrentUser{name: "operator"}
+			validator := newValidator(&fakeEnvironment{}, remote)
+			validator.CurrentUser = current
+
+			report := validator.Check(context.Background(), cfg, tt.jobNames, Options{
+				Connectivity: true,
+				BinaryPath:   "/bin/ezdbbackup",
+				ConfigPath:   "/etc/ezdbbackup/config.yml",
+			})
+
+			if report.HasErrors() {
+				t.Fatalf("Check() report = %#v, want warning-only report", report.Findings)
+			}
+			if current.calls != 1 {
+				t.Fatalf("CurrentUsername calls = %d, want 1", current.calls)
+			}
+			wantJobs := []string{"alpha", "zulu"}
+			var warningJobs []string
+			for _, finding := range report.Findings {
+				if finding.Check != "connectivity_identity" {
+					continue
+				}
+				warningJobs = append(warningJobs, finding.Job)
+				if finding.Severity != SeverityWarning {
+					t.Errorf("identity finding severity = %q, want warning", finding.Severity)
+				}
+				if !strings.Contains(finding.Message, "probes use invoking user \"operator\"") ||
+					!strings.Contains(finding.Message, "sudo -u "+finding.Job+"-user ezdbbackup validate --connectivity") {
+					t.Errorf("identity finding message = %q, want invoking identity and rerun recommendation", finding.Message)
+				}
+			}
+			if !reflect.DeepEqual(warningJobs, wantJobs) {
+				t.Fatalf("identity warning jobs = %#v, want lexical %#v", warningJobs, wantJobs)
+			}
+			wantCalls := []string{
+				"resolve-dump:alpha", "dump-probe:alpha", "resolve-storage:alpha", "new-store:alpha", "store-probe:alpha-bucket",
+				"resolve-dump:zulu", "dump-probe:zulu", "resolve-storage:zulu", "new-store:zulu", "store-probe:zulu-bucket",
+			}
+			if !reflect.DeepEqual(remote.calls, wantCalls) {
+				t.Fatalf("connectivity calls = %#v, want probes to continue %#v", remote.calls, wantCalls)
+			}
+		})
+	}
+}
+
+func TestValidatorConnectivityDoesNotWarnForSameInvokingUser(t *testing.T) {
+	cfg := validValidationConfig()
+	job := validValidationJob("alpha", true)
+	job.RunAs = "operator"
+	cfg.Jobs["alpha"] = job
+	remote := &fakeRemoteDependencies{}
+	validator := newValidator(&fakeEnvironment{}, remote)
+	validator.CurrentUser = &fakeCurrentUser{name: "operator"}
+
+	report := validator.Check(context.Background(), cfg, nil, Options{
+		Connectivity: true,
+		BinaryPath:   "/bin/ezdbbackup",
+		ConfigPath:   "/etc/ezdbbackup/config.yml",
+	})
+
+	if hasFinding(report, "alpha", "connectivity_identity", "") {
+		t.Fatalf("Check() findings = %#v, want no same-user identity warning", report.Findings)
+	}
+	if len(remote.calls) != 5 {
+		t.Fatalf("connectivity calls = %#v, want both probes", remote.calls)
+	}
+}
+
 func TestValidatorCompletesAllLocalChecksBeforeConnectivity(t *testing.T) {
 	cfg := validValidationConfig()
 	cfg.Jobs["bravo"] = validValidationJob("bravo", true)
@@ -352,6 +443,17 @@ func (s fakeStore) Probe(_ context.Context, bucket string) error {
 
 type recordingResolver struct {
 	read func(string) ([]byte, error)
+}
+
+type fakeCurrentUser struct {
+	name  string
+	err   error
+	calls int
+}
+
+func (f *fakeCurrentUser) CurrentUsername() (string, error) {
+	f.calls++
+	return f.name, f.err
 }
 
 func (r recordingResolver) Dump(job config.JobConfig) (dump.Request, error) {
