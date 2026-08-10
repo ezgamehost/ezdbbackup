@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -480,6 +481,8 @@ func (runtimeStager) Stage(ctx context.Context, _ string, write func(io.Writer) 
 
 func (runtimeStager) Remove(stage.Artifact) error { return nil }
 
+func (runtimeStager) Open(stage.Artifact) (*os.File, error) { return os.Open(os.DevNull) }
+
 type runtimeFactory struct{}
 
 func (runtimeFactory) New(context.Context, storage.Options) (storage.Store, error) {
@@ -488,7 +491,7 @@ func (runtimeFactory) New(context.Context, storage.Options) (storage.Store, erro
 
 type runtimeStore struct{}
 
-func (runtimeStore) UploadFile(context.Context, string, string, string) (storage.UploadResult, error) {
+func (runtimeStore) UploadFile(context.Context, string, string, io.ReaderAt, int64) (storage.UploadResult, error) {
 	return storage.UploadResult{}, nil
 }
 

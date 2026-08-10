@@ -1,6 +1,9 @@
 package storage
 
-import "context"
+import (
+	"context"
+	"io"
+)
 
 type Credentials struct {
 	AccessKeyID     string
@@ -22,7 +25,7 @@ type UploadResult struct {
 }
 
 type Store interface {
-	UploadFile(context.Context, string, string, string) (UploadResult, error)
+	UploadFile(context.Context, string, string, io.ReaderAt, int64) (UploadResult, error)
 	Probe(context.Context, string) error
 }
 

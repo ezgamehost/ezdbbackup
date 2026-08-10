@@ -59,37 +59,40 @@ type uploadStore struct {
 	bucket     string
 	key        string
 	path       string
+	source     *os.File
+	size       int64
 	contents   string
 	exists     bool
 	uploadErr  error
 	uploadDone bool
+	beforeRead func(*os.File)
 }
 
-func (s *uploadStore) UploadFile(_ context.Context, bucket, key, path string) (storage.UploadResult, error) {
+func (s *uploadStore) UploadFile(_ context.Context, bucket, key string, source io.ReaderAt, size int64) (storage.UploadResult, error) {
 	s.calls++
-	s.bucket, s.key, s.path = bucket, key, path
-	_, statErr := os.Stat(path)
-	s.exists = statErr == nil
-	file, err := os.Open(path)
-	if err != nil {
-		return storage.UploadResult{}, err
+	s.bucket, s.key, s.size = bucket, key, size
+	file, ok := source.(*os.File)
+	if !ok {
+		return storage.UploadResult{}, fmt.Errorf("upload source type = %T, want verified *os.File", source)
 	}
-	reader, err := gzip.NewReader(file)
+	s.source = file
+	s.path = file.Name()
+	_, statErr := os.Stat(s.path)
+	s.exists = statErr == nil
+	if s.beforeRead != nil {
+		s.beforeRead(file)
+	}
+	reader, err := gzip.NewReader(io.NewSectionReader(source, 0, size))
 	if err != nil {
-		_ = file.Close()
 		return storage.UploadResult{}, err
 	}
 	data, readErr := io.ReadAll(reader)
 	closeErr := reader.Close()
-	fileCloseErr := file.Close()
 	if readErr != nil {
 		return storage.UploadResult{}, readErr
 	}
 	if closeErr != nil {
 		return storage.UploadResult{}, closeErr
-	}
-	if fileCloseErr != nil {
-		return storage.UploadResult{}, fileCloseErr
 	}
 	s.contents = string(data)
 	s.uploadDone = true
@@ -111,7 +114,30 @@ func (s failingStager) Stage(context.Context, string, func(io.Writer) error) (st
 	return stage.Artifact{}, s.err
 }
 
+func (failingStager) Open(stage.Artifact) (*os.File, error) {
+	return nil, errors.New("unexpected Open")
+}
+
 func (failingStager) Remove(stage.Artifact) error { return nil }
+
+type replacingBeforeOpenStager struct {
+	stage.GzipStager
+	replacement string
+}
+
+func (s *replacingBeforeOpenStager) Stage(ctx context.Context, dir string, write func(io.Writer) error) (stage.Artifact, error) {
+	artifact, err := s.GzipStager.Stage(ctx, dir, write)
+	if err != nil {
+		return stage.Artifact{}, err
+	}
+	if err := os.Rename(artifact.Path, artifact.Path+".original"); err != nil {
+		return stage.Artifact{}, err
+	}
+	if err := os.WriteFile(artifact.Path, []byte(s.replacement), 0o600); err != nil {
+		return stage.Artifact{}, err
+	}
+	return artifact, nil
+}
 
 func (s removeErrorStager) Remove(artifact stage.Artifact) error {
 	removeErr := s.GzipStager.Remove(artifact)
@@ -161,7 +187,7 @@ func TestRunStagesAndUploadsDumpThenRemovesArtifact(t *testing.T) {
 	job := config.JobConfig{
 		Enabled:    true,
 		DumpBinary: "/usr/local/bin/mysqldump",
-		TempDir:    t.TempDir(),
+		TempDir:    secureBackupTempDir(t),
 		MySQL: config.MySQLConfig{
 			Host:      "db.internal",
 			Port:      3307,
@@ -212,6 +238,12 @@ func TestRunStagesAndUploadsDumpThenRemovesArtifact(t *testing.T) {
 	}
 	if !store.exists || !store.uploadDone || store.contents != "CREATE TABLE widgets(id INT);\n" {
 		t.Fatalf("staged upload = exists:%t complete:%t contents:%q", store.exists, store.uploadDone, store.contents)
+	}
+	if store.size != result.Size {
+		t.Fatalf("upload size = %d, want staged size %d", store.size, result.Size)
+	}
+	if _, statErr := store.source.Stat(); !errors.Is(statErr, os.ErrClosed) {
+		t.Fatalf("verified upload descriptor Stat() error = %v, want closed", statErr)
 	}
 	if _, err := os.Stat(store.path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("staged artifact after Run() = %v, want removed", err)
@@ -278,7 +310,7 @@ func TestRunDumpFailurePreventsStoreCreationAndUpload(t *testing.T) {
 		Stores:  factory,
 		Log:     &memorySink{},
 	}
-	job := config.JobConfig{TempDir: t.TempDir(), MySQL: config.MySQLConfig{Databases: config.DatabaseSelection{All: true}}}
+	job := config.JobConfig{TempDir: secureBackupTempDir(t), MySQL: config.MySQLConfig{Databases: config.DatabaseSelection{All: true}}}
 
 	_, err := service.Run(context.Background(), "production", job)
 	if !errors.Is(err, dumpErr) {
@@ -413,6 +445,62 @@ func TestRunUploadFailureStillRemovesArtifact(t *testing.T) {
 	}
 }
 
+// This fails if orchestration passes a staged path directly to storage and a
+// replacement inserted after Stage can be uploaded.
+func TestRunRejectsReplacementBeforeVerifiedOpen(t *testing.T) {
+	const replacement = "replacement must never upload"
+	stager := &replacingBeforeOpenStager{replacement: replacement}
+	store := &uploadStore{}
+	service := successfulService(t, store, stager, &memorySink{})
+	job := backupJob(t)
+
+	_, err := service.Run(context.Background(), "production", job)
+	if err == nil || errorStage(err) != "temporary_storage" {
+		t.Fatalf("Run() error = %v, want temporary_storage identity failure", err)
+	}
+	if store.calls != 0 {
+		t.Fatalf("upload calls = %d, want none for replaced artifact", store.calls)
+	}
+	entries, readErr := os.ReadDir(job.TempDir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("staging entries = %v, want replacement work directory left for safety", entries)
+	}
+}
+
+// This fails if storage reopens the path after the service has verified it or
+// if cleanup unlinks a replacement installed while upload reads the original
+// descriptor.
+func TestRunUploadsVerifiedDescriptorAndLeavesLaterReplacement(t *testing.T) {
+	const replacement = "unrelated replacement"
+	store := &uploadStore{}
+	store.beforeRead = func(file *os.File) {
+		if err := os.Rename(file.Name(), file.Name()+".original"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file.Name(), []byte(replacement), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := successfulService(t, store, stage.GzipStager{}, &memorySink{})
+
+	result, err := service.Run(context.Background(), "production", backupJob(t))
+	if err == nil || errorStage(err) != "cleanup" {
+		t.Fatalf("Run() result/error = %#v, %v; want upload metadata plus cleanup safety error", result, err)
+	}
+	if store.contents != "SELECT 1;\n" {
+		t.Fatalf("uploaded contents = %q, want original staged dump", store.contents)
+	}
+	if got, readErr := os.ReadFile(store.path); readErr != nil || string(got) != replacement {
+		t.Fatalf("replacement after cleanup = %q, %v; want untouched", got, readErr)
+	}
+	if _, statErr := store.source.Stat(); !errors.Is(statErr, os.ErrClosed) {
+		t.Fatalf("verified upload descriptor Stat() error = %v, want closed", statErr)
+	}
+}
+
 func TestRunReturnsCleanupFailureAfterOtherwiseSuccessfulBackup(t *testing.T) {
 	cleanupErr := errors.New("cleanup denied")
 	store := &uploadStore{}
@@ -521,10 +609,19 @@ func backupJob(t *testing.T) config.JobConfig {
 	t.Helper()
 	return config.JobConfig{
 		Enabled: true,
-		TempDir: t.TempDir(),
+		TempDir: secureBackupTempDir(t),
 		MySQL:   config.MySQLConfig{Databases: config.DatabaseSelection{All: true}},
 		S3:      config.S3Config{Bucket: "backups", Region: "us-east-1"},
 	}
+}
+
+func secureBackupTempDir(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return directory
 }
 
 func errorStage(err error) string {

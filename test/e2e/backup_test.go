@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -51,7 +52,7 @@ func TestBackupToS3(t *testing.T) {
 	t.Cleanup(cancel)
 
 	repository := repositoryRoot(t)
-	temporary := t.TempDir()
+	temporary := secureIntegrationTempDir(t)
 	backupBinary := filepath.Join(temporary, "ezdbbackup")
 	fakeDumpBinary := filepath.Join(temporary, "mysqldump-fake")
 	buildBinary(t, ctx, repository, backupBinary, "./cmd/ezdbbackup")
@@ -134,7 +135,7 @@ func TestBackupDumpFailureIsLoggedAndCleaned(t *testing.T) {
 	t.Cleanup(cancel)
 
 	repository := repositoryRoot(t)
-	temporary := t.TempDir()
+	temporary := secureIntegrationTempDir(t)
 	backupBinary := filepath.Join(temporary, "ezdbbackup")
 	fakeDumpBinary := filepath.Join(temporary, "mysqldump-fake")
 	buildBinary(t, ctx, repository, backupBinary, "./cmd/ezdbbackup")
@@ -207,7 +208,7 @@ func TestBackupRetriesTransientS3Upload(t *testing.T) {
 	t.Cleanup(cancel)
 
 	repository := repositoryRoot(t)
-	temporary := t.TempDir()
+	temporary := secureIntegrationTempDir(t)
 	backupBinary := filepath.Join(temporary, "ezdbbackup")
 	fakeDumpBinary := filepath.Join(temporary, "mysqldump-fake")
 	buildBinary(t, ctx, repository, backupBinary, "./cmd/ezdbbackup")
@@ -281,6 +282,128 @@ func TestBackupRetriesTransientS3Upload(t *testing.T) {
 	assertNoStagedBackup(t, stageDirectory)
 }
 
+func TestBackupAbortsFailedMultipartUploadAndCleansStaging(t *testing.T) {
+	endpoint := os.Getenv("EZDBBACKUP_TEST_S3_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("integration test requires EZDBBACKUP_TEST_S3_ENDPOINT (for example http://127.0.0.1:4566)")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	t.Cleanup(cancel)
+	repository := repositoryRoot(t)
+	temporary := secureIntegrationTempDir(t)
+	backupBinary := filepath.Join(temporary, "ezdbbackup")
+	fakeDumpBinary := filepath.Join(temporary, "mysqldump-fake")
+	buildBinary(t, ctx, repository, backupBinary, "./cmd/ezdbbackup")
+	buildBinary(t, ctx, repository, fakeDumpBinary, "./test/fakedump")
+
+	stageDirectory := filepath.Join(temporary, "stage")
+	logDirectory := filepath.Join(temporary, "logs")
+	for _, directory := range []string{stageDirectory, logDirectory} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatalf("create integration directory %q: %v", directory, err)
+		}
+	}
+	currentUser, err := user.Current()
+	if err != nil {
+		t.Fatalf("look up current user: %v", err)
+	}
+	bucket := integrationBucket(temporary)
+	directClient := newS3Client(t, ctx, endpoint)
+	if _, err := directClient.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("create integration bucket: %v", err)
+	}
+	t.Cleanup(func() { cleanBucket(t, directClient, bucket) })
+
+	proxy := newMultipartFailureProxy(t, endpoint)
+	configPath := filepath.Join(temporary, "config.yml")
+	writeConfig(t, configPath, integrationConfig{
+		Bucket:         bucket,
+		DumpBinary:     fakeDumpBinary,
+		Endpoint:       proxy.server.URL,
+		LogDirectory:   logDirectory,
+		RunAs:          currentUser.Username,
+		StageDirectory: stageDirectory,
+	})
+	output, exitCode := runCLIWithEnvironment(
+		t,
+		ctx,
+		backupBinary,
+		map[string]string{"FAKE_DUMP_RANDOM_BYTES": strconv.Itoa(12 << 20)},
+		"backup", "production", "--config", configPath,
+	)
+	if exitCode != 1 {
+		t.Fatalf("multipart backup exit code = %d, want 1\n%s", exitCode, output)
+	}
+	if bytes.Contains(output, []byte("MULTIPART_ENDPOINT_SECRET")) {
+		t.Fatalf("multipart failure output exposed endpoint body: %s", output)
+	}
+	assertLogsOmit(t, logDirectory, "MULTIPART_ENDPOINT_SECRET")
+	if proxy.creates.Load() != 1 || proxy.failedParts.Load() == 0 || proxy.aborts.Load() != 1 {
+		t.Fatalf("multipart proxy calls = create:%d failed-parts:%d abort:%d, want 1/>0/1", proxy.creates.Load(), proxy.failedParts.Load(), proxy.aborts.Load())
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		uploads, err := directClient.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: aws.String(bucket)})
+		if err != nil {
+			t.Fatalf("list multipart uploads: %v", err)
+		}
+		if len(uploads.Uploads) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("orphaned multipart uploads remain: %#v", uploads.Uploads)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	objects, err := directClient.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
+	if err != nil {
+		t.Fatalf("list objects after multipart failure: %v", err)
+	}
+	if len(objects.Contents) != 0 {
+		t.Fatalf("objects after multipart failure = %d, want 0", len(objects.Contents))
+	}
+	assertNoStagedBackup(t, stageDirectory)
+}
+
+type multipartFailureProxy struct {
+	server      *httptest.Server
+	creates     atomic.Int32
+	failedParts atomic.Int32
+	aborts      atomic.Int32
+}
+
+func newMultipartFailureProxy(t *testing.T, endpoint string) *multipartFailureProxy {
+	t.Helper()
+	target, err := url.Parse(endpoint)
+	if err != nil {
+		t.Fatalf("parse LocalStack endpoint: %v", err)
+	}
+	proxy := &multipartFailureProxy{}
+	reverseProxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		query := request.URL.Query()
+		switch {
+		case request.Method == http.MethodPost && query.Has("uploads"):
+			proxy.creates.Add(1)
+		case request.Method == http.MethodPut && query.Get("partNumber") == "2" && query.Get("uploadId") != "":
+			proxy.failedParts.Add(1)
+			_, _ = io.Copy(io.Discard, request.Body)
+			_ = request.Body.Close()
+			writer.Header().Set("Content-Type", "application/xml")
+			writer.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(writer, `<Error><Code>InvalidRequest</Code><Message>MULTIPART_ENDPOINT_SECRET `+request.URL.String()+`</Message></Error>`)
+			return
+		case request.Method == http.MethodDelete && query.Get("uploadId") != "":
+			proxy.aborts.Add(1)
+		}
+		reverseProxy.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(proxy.server.Close)
+	return proxy
+}
+
 func newTransientUploadProxy(t *testing.T, endpoint, bucket string) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
 	target, err := url.Parse(endpoint)
@@ -318,6 +441,15 @@ func repositoryRoot(t *testing.T) string {
 	return filepath.Clean(filepath.Join(filepath.Dir(filename), "..", ".."))
 }
 
+func secureIntegrationTempDir(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatalf("secure integration temp directory: %v", err)
+	}
+	return directory
+}
+
 func buildBinary(t *testing.T, ctx context.Context, repository, output, target string) {
 	t.Helper()
 	command := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", output, target)
@@ -353,6 +485,19 @@ func cleanBucket(t *testing.T, client *s3.Client, bucket string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	uploads, err := client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: aws.String(bucket)})
+	if err != nil {
+		t.Errorf("cleanup: list multipart uploads: %v", err)
+		return
+	}
+	for _, upload := range uploads.Uploads {
+		if _, err := client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+			Bucket: aws.String(bucket), Key: upload.Key, UploadId: upload.UploadId,
+		}); err != nil {
+			t.Errorf("cleanup: abort multipart upload: %v", err)
+			return
+		}
+	}
 	objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
 	if err != nil {
 		t.Errorf("cleanup: list integration objects: %v", err)
@@ -421,7 +566,7 @@ jobs:
 func runCLI(t *testing.T, ctx context.Context, binary string, arguments ...string) {
 	t.Helper()
 	command := exec.CommandContext(ctx, binary, arguments...)
-	command.Env = environmentWithout("FAKE_DUMP_FAIL")
+	command.Env = environmentWithout("FAKE_DUMP_FAIL", "FAKE_DUMP_RANDOM_BYTES")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("run ezdbbackup %s: %v\n%s", strings.Join(arguments, " "), err, output)
@@ -581,18 +726,35 @@ func assertDumpFailureLog(t *testing.T, directory, password string) {
 	}
 }
 
+func assertLogsOmit(t *testing.T, directory string, forbidden ...string) {
+	t.Helper()
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("read log directory: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		for _, value := range forbidden {
+			if value != "" && bytes.Contains(contents, []byte(value)) {
+				t.Fatalf("%s exposed forbidden text %q", entry.Name(), value)
+			}
+		}
+	}
+}
+
 func assertNoStagedBackup(t *testing.T, directory string) {
 	t.Helper()
-	err := filepath.WalkDir(directory, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql.gz") {
-			return fmt.Errorf("staged backup remains at %s", path)
-		}
-		return nil
-	})
+	entries, err := os.ReadDir(directory)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("staging directory entries remain: %v", entries)
 	}
 }

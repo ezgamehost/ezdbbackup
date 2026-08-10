@@ -160,7 +160,7 @@ func configWithJobs(t *testing.T, jobs map[string]bool) *config.Config {
 	for name, enabled := range jobs {
 		cfg.Jobs[name] = config.JobConfig{
 			Enabled: enabled,
-			TempDir: t.TempDir(),
+			TempDir: secureBackupTempDir(t),
 			MySQL: config.MySQLConfig{
 				User:      name,
 				Databases: config.DatabaseSelection{All: true},

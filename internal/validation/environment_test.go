@@ -7,6 +7,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -242,6 +243,104 @@ func TestOSEnvironmentWritableTargetUsesExistingDirectoryOrNearestParent(t *test
 	}
 	if err := env.CheckWritableTarget(file, runAs); err == nil || !strings.Contains(err.Error(), "directory") {
 		t.Fatalf("CheckWritableTarget(file) error = %v, want directory error", err)
+	}
+}
+
+// This fails if a shared non-sticky temporary directory permits another user
+// to rename or replace a staged artifact entry.
+func TestOSEnvironmentStagingTargetRejectsSharedNonStickyDirectory(t *testing.T) {
+	requireLinux(t)
+	runAs := currentUsername(t)
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	err := (OSEnvironment{}).CheckStagingTarget(directory, runAs)
+	if err == nil || !strings.Contains(err.Error(), "sticky") {
+		t.Fatalf("CheckStagingTarget(shared non-sticky) error = %v, want sticky-directory safety error", err)
+	}
+}
+
+// This fails if a secure sticky parent such as /tmp is rejected even though
+// Stage creates a private mode-0700 work directory beneath it.
+func TestOSEnvironmentStagingTargetAllowsStickyAndPrivateDirectories(t *testing.T) {
+	requireLinux(t)
+	runAs := currentUsername(t)
+	env := OSEnvironment{}
+
+	privateDirectory := t.TempDir()
+	if err := os.Chmod(privateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.CheckStagingTarget(privateDirectory, runAs); err != nil {
+		t.Fatalf("CheckStagingTarget(private) error = %v", err)
+	}
+
+	stickyParent := t.TempDir()
+	if err := os.Chmod(stickyParent, os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+	missingTarget := filepath.Join(stickyParent, "ezdbbackup")
+	if err := env.CheckStagingTarget(missingTarget, runAs); err != nil {
+		t.Fatalf("CheckStagingTarget(sticky parent) error = %v", err)
+	}
+	if _, err := os.Stat(missingTarget); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("CheckStagingTarget created target or returned unexpected stat error: %v", err)
+	}
+}
+
+// This fails if a private target can be renamed wholesale by a writer of its
+// containing directory, stranding the sensitive work directory after Stage.
+func TestOSEnvironmentStagingTargetRequiresSafeAncestors(t *testing.T) {
+	requireLinux(t)
+	runAs := currentUsername(t)
+	sharedParent := t.TempDir()
+	if err := os.Chmod(sharedParent, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	privateTarget := filepath.Join(sharedParent, "staging")
+	if err := os.Mkdir(privateTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := (OSEnvironment{}).CheckStagingTarget(privateTarget, runAs); err == nil {
+		t.Fatal("CheckStagingTarget(private beneath shared non-sticky parent) error = nil")
+	}
+	if err := os.Chmod(sharedParent, os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := (OSEnvironment{}).CheckStagingTarget(privateTarget, runAs); err != nil {
+		t.Fatalf("CheckStagingTarget(private beneath sticky parent) error = %v", err)
+	}
+}
+
+// This fails if an intended root process accepts a temporary location owned
+// by an unrelated account whose owner can later replace directory entries.
+func TestOSEnvironmentStagingTargetRejectsAttackerOwnedDirectory(t *testing.T) {
+	requireLinux(t)
+	if os.Geteuid() != 0 {
+		t.Skip("ownership fixture requires root")
+	}
+	other := lookupDifferentUser(t)
+	directory := t.TempDir()
+	uid, err := strconv.Atoi(other.Uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid, err := strconv.Atoi(other.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(directory, uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	err = (OSEnvironment{}).CheckStagingTarget(directory, currentUsername(t))
+	if err == nil || !strings.Contains(err.Error(), "owner") {
+		t.Fatalf("CheckStagingTarget(attacker-owned) error = %v, want owner safety error", err)
 	}
 }
 

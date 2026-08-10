@@ -26,6 +26,10 @@ type runAsExecutableEnvironment interface {
 	CheckExecutableAs(ctx context.Context, path, runAs string) error
 }
 
+type stagingTargetEnvironment interface {
+	CheckStagingTarget(path, runAs string) error
+}
+
 // OSEnvironment checks the host filesystem and user database. Permission
 // decisions are based on the intended user's IDs and file metadata, rather
 // than the privileges of the validating process. These are point-in-time
@@ -122,6 +126,65 @@ func (OSEnvironment) CheckWritableTarget(path, runAs string) error {
 		}
 		candidate = parent
 	}
+}
+
+// CheckStagingTarget applies the writable-target checks plus replacement
+// protections needed for sensitive staged artifacts. Private user/root-owned
+// directories are accepted. Shared writable ancestors must be sticky, and
+// every existing target ancestor must be owned by root or run_as so the
+// configured directory cannot be renamed out from under runtime identity
+// checks.
+func (OSEnvironment) CheckStagingTarget(path, runAs string) error {
+	if err := (OSEnvironment{}).CheckWritableTarget(path, runAs); err != nil {
+		return err
+	}
+	identity, err := lookupIdentity(runAs)
+	if err != nil {
+		return err
+	}
+	candidate := filepath.Clean(path)
+	for {
+		_, statErr := os.Stat(candidate)
+		if statErr == nil {
+			break
+		}
+		if !os.IsNotExist(statErr) {
+			return fmt.Errorf("inspect staging target: %w", statErr)
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return errors.New("find nearest existing staging parent")
+		}
+		candidate = parent
+	}
+	for {
+		info, err := os.Stat(candidate)
+		if err != nil {
+			return fmt.Errorf("inspect staging ancestor: %w", err)
+		}
+		if err := validateStagingDirectory(candidate, info, identity); err != nil {
+			return err
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return nil
+		}
+		candidate = parent
+	}
+}
+
+func validateStagingDirectory(path string, info os.FileInfo, identity userIdentity) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("inspect staging directory ownership")
+	}
+	if stat.Uid != 0 && stat.Uid != identity.uid {
+		return fmt.Errorf("staging directory %q has an unrelated owner", path)
+	}
+	if info.Mode().Perm()&0o022 != 0 && info.Mode()&os.ModeSticky == 0 {
+		return fmt.Errorf("shared writable staging directory %q must have the sticky bit", path)
+	}
+	return nil
 }
 
 func (OSEnvironment) CheckSecretFile(path, runAs string) error {

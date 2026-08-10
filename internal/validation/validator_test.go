@@ -30,9 +30,9 @@ func TestValidatorChecksEveryJobIncludingDisabledInLexicalOrder(t *testing.T) {
 	}
 	want := []string{
 		"cron:/usr/local/bin/ezdbbackup", "cron:/etc/ezdbbackup/config.yml",
-		"user:alpha-user", "executable:/dump/alpha:alpha-user", "writable:/tmp/alpha:alpha-user", "writable:/logs:alpha-user",
+		"user:alpha-user", "executable:/dump/alpha:alpha-user", "staging:/tmp/alpha:alpha-user", "writable:/logs:alpha-user",
 		"secret:/secrets/alpha-mysql:alpha-user", "secret:/secrets/alpha-access:alpha-user", "secret:/secrets/alpha-secret:alpha-user", "secret:/secrets/alpha-session:alpha-user",
-		"user:zulu-user", "executable:/dump/zulu:zulu-user", "writable:/tmp/zulu:zulu-user", "writable:/logs:zulu-user",
+		"user:zulu-user", "executable:/dump/zulu:zulu-user", "staging:/tmp/zulu:zulu-user", "writable:/logs:zulu-user",
 		"secret:/secrets/zulu-mysql:zulu-user", "secret:/secrets/zulu-access:zulu-user", "secret:/secrets/zulu-secret:zulu-user", "secret:/secrets/zulu-session:zulu-user",
 	}
 	if !reflect.DeepEqual(env.calls, want) {
@@ -131,7 +131,7 @@ func TestValidatorLocalOnlyReturnsFindingsWithoutResolvingOrCallingRemote(t *tes
 	cfg := validValidationConfig()
 	cfg.Jobs["alpha"] = validValidationJob("alpha", true)
 	env := &fakeEnvironment{errors: map[string]error{
-		"writable:/tmp/alpha:alpha-user": errors.New("read-only filesystem"),
+		"staging:/tmp/alpha:alpha-user": errors.New("replaceable temporary directory"),
 	}}
 	remote := &fakeRemoteDependencies{}
 
@@ -485,6 +485,10 @@ func (f *fakeEnvironment) CheckWritableTarget(path, runAs string) error {
 	return f.call("writable:" + path + ":" + runAs)
 }
 
+func (f *fakeEnvironment) CheckStagingTarget(path, runAs string) error {
+	return f.call("staging:" + path + ":" + runAs)
+}
+
 func (f *fakeEnvironment) CheckSecretFile(path, runAs string) error {
 	return f.call("secret:" + path + ":" + runAs)
 }
@@ -543,7 +547,7 @@ type fakeStore struct {
 	owner *fakeRemoteDependencies
 }
 
-func (fakeStore) UploadFile(context.Context, string, string, string) (storage.UploadResult, error) {
+func (fakeStore) UploadFile(context.Context, string, string, io.ReaderAt, int64) (storage.UploadResult, error) {
 	return storage.UploadResult{}, errors.New("UploadFile must not be used by validation")
 }
 
@@ -595,7 +599,7 @@ type secretConnectivityStore struct {
 	owner *secretConnectivityDependencies
 }
 
-func (secretConnectivityStore) UploadFile(context.Context, string, string, string) (storage.UploadResult, error) {
+func (secretConnectivityStore) UploadFile(context.Context, string, string, io.ReaderAt, int64) (storage.UploadResult, error) {
 	return storage.UploadResult{}, errors.New("UploadFile must not be used by validation")
 }
 

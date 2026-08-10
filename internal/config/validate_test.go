@@ -2,6 +2,7 @@ package config
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -231,6 +232,167 @@ func TestValidateWarnsForPlainHTTPEndpoint(t *testing.T) {
 	}
 	if findings.HasErrors() {
 		t.Fatalf("unexpected errors: %v", findings)
+	}
+}
+
+// This fails if AWS bucket names that cannot be addressed safely are allowed
+// to reach the SDK's standard S3 endpoint resolver.
+func TestValidateS3BucketGrammarForAWS(t *testing.T) {
+	for _, bucket := range []string{
+		"ab",
+		"Uppercase",
+		"under_score",
+		"192.168.1.1",
+		"adjacent..dots",
+		"dot.-hyphen",
+		"xn--reserved",
+		"reserved-s3alias",
+	} {
+		t.Run(bucket, func(t *testing.T) {
+			cfg := validConfig()
+			job := cfg.Jobs["production"]
+			job.S3.Bucket = bucket
+			cfg.Jobs["production"] = job
+			if findings := Validate(cfg); !findings.HasErrors() {
+				t.Fatalf("Validate() findings = %v, want invalid AWS bucket %q rejected", findings, bucket)
+			}
+		})
+	}
+
+	cfg := validConfig()
+	job := cfg.Jobs["production"]
+	job.S3.Bucket = "daily.backups-2026"
+	cfg.Jobs["production"] = job
+	if findings := Validate(cfg); findings.HasErrors() {
+		t.Fatalf("Validate() findings = %v, want valid AWS bucket accepted", findings)
+	}
+}
+
+// This fails if custom endpoints permit bucket text that can escape a path or
+// corrupt terminal/log output. Compatible services may use uppercase and
+// underscore, but the value remains one bounded bucket segment.
+func TestValidateS3BucketGrammarForCustomEndpoint(t *testing.T) {
+	for _, bucket := range []string{"ab", ".hidden", "trailing-", "bad/bucket", `bad\bucket`, "bad\nbucket"} {
+		t.Run(bucket, func(t *testing.T) {
+			cfg := validConfig()
+			job := cfg.Jobs["production"]
+			job.S3.Endpoint = "https://objects.example.test/base"
+			job.S3.Bucket = bucket
+			cfg.Jobs["production"] = job
+			if findings := Validate(cfg); !findings.HasErrors() {
+				t.Fatalf("Validate() findings = %v, want unsafe custom bucket %q rejected", findings, bucket)
+			}
+		})
+	}
+
+	cfg := validConfig()
+	job := cfg.Jobs["production"]
+	job.S3.Endpoint = "https://objects.example.test/base"
+	job.S3.Bucket = "Backup_01"
+	cfg.Jobs["production"] = job
+	if findings := Validate(cfg); findings.HasErrors() {
+		t.Fatalf("Validate() findings = %v, want conservative compatible bucket accepted", findings)
+	}
+}
+
+// This fails if endpoint credentials, query material, fragments, malformed
+// hosts, or percent-encoded controls can cross the SDK/terminal boundary.
+func TestValidateS3EndpointStructure(t *testing.T) {
+	invalid := []string{
+		"https://user:password@objects.example.test/base",
+		"https://objects.example.test/base?session=secret",
+		"https://objects.example.test/base#fragment",
+		"https://objects.example.test/%0aheader",
+		"https://objects.example.test:70000/base",
+		"https://under_score.example.test/base",
+		"https://objects.example.test/base\nnext",
+	}
+	for _, endpoint := range invalid {
+		t.Run(endpoint, func(t *testing.T) {
+			cfg := validConfig()
+			job := cfg.Jobs["production"]
+			job.S3.Endpoint = endpoint
+			cfg.Jobs["production"] = job
+			if findings := Validate(cfg); !findings.HasErrors() {
+				t.Fatalf("Validate() findings = %v, want unsafe endpoint rejected", findings)
+			}
+		})
+	}
+
+	for _, endpoint := range []string{"https://objects.example.test/base/path", "http://127.0.0.1:9000/s3", "http://[::1]:9000/s3"} {
+		t.Run(endpoint, func(t *testing.T) {
+			cfg := validConfig()
+			job := cfg.Jobs["production"]
+			job.S3.Endpoint = endpoint
+			cfg.Jobs["production"] = job
+			if findings := Validate(cfg); findings.HasErrors() {
+				t.Fatalf("Validate() findings = %v, want endpoint path prefix preserved", findings)
+			}
+		})
+	}
+}
+
+// This fails if regions or prefixes can inject controls or invalid byte
+// sequences into signing, object keys, or human-readable findings.
+func TestValidateS3RegionAndPrefixStructure(t *testing.T) {
+	for _, region := range []string{"-us-east-1", "us-east-1-", "us--east-1", "US-EAST-1", "us/east/1", "us-east-1\nnext", strings.Repeat("a", 64)} {
+		t.Run("region_"+region, func(t *testing.T) {
+			cfg := validConfig()
+			job := cfg.Jobs["production"]
+			job.S3.Region = region
+			cfg.Jobs["production"] = job
+			if findings := Validate(cfg); !findings.HasErrors() {
+				t.Fatalf("Validate() findings = %v, want invalid region rejected", findings)
+			}
+		})
+	}
+
+	for _, prefix := range []string{
+		"daily\nmysql",
+		"daily\x00mysql",
+		"daily/\u2028mysql",
+		"daily/\u202emysql",
+		"../daily",
+		"daily/./mysql",
+		strings.Repeat("a", 1000),
+		string([]byte{0xff, 'x'}),
+	} {
+		t.Run("prefix", func(t *testing.T) {
+			cfg := validConfig()
+			job := cfg.Jobs["production"]
+			job.S3.Prefix = prefix
+			cfg.Jobs["production"] = job
+			if findings := Validate(cfg); !findings.HasErrors() {
+				t.Fatalf("Validate() findings = %v, want unsafe prefix rejected", findings)
+			}
+		})
+	}
+
+	cfg := validConfig()
+	job := cfg.Jobs["production"]
+	job.S3.Region = "us-gov-west-1"
+	job.S3.Prefix = "production/数据库"
+	cfg.Jobs["production"] = job
+	if findings := Validate(cfg); findings.HasErrors() {
+		t.Fatalf("Validate() findings = %v, want valid region and UTF-8 prefix accepted", findings)
+	}
+}
+
+// This fails if validation reflects attacker-controlled S3 text into a
+// terminal diagnostic instead of returning a fixed structural description.
+func TestValidateS3FindingsDoNotEchoUnsafeValues(t *testing.T) {
+	const marker = "TERMINAL_SECRET"
+	cfg := validConfig()
+	job := cfg.Jobs["production"]
+	job.S3.Bucket = marker + "\nnext"
+	job.S3.Region = marker + "\tregion"
+	job.S3.Endpoint = "https://objects.example.test/base?token=" + marker
+	job.S3.Prefix = marker + "\rprefix"
+	cfg.Jobs["production"] = job
+
+	text := Validate(cfg).Error()
+	if strings.Contains(text, marker) || strings.ContainsAny(text, "\r\n\t") {
+		t.Fatalf("Validate() findings exposed unsafe S3 input: %q", text)
 	}
 }
 

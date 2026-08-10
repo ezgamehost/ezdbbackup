@@ -3,17 +3,28 @@ package config
 import (
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/ezgamehost/ezdbbackup/internal/mysqldumpopt"
 )
 
-var jobNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+var (
+	jobNamePattern       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+	awsBucketPattern     = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
+	customBucketPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{1,61}[A-Za-z0-9]$`)
+	regionPattern        = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+	domainLabelPattern   = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+	reservedBucketPrefix = []string{"xn--", "sthree-", "amzn-s3-demo-"}
+	reservedBucketSuffix = []string{"-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3"}
+)
 
 const (
 	maxRotationSizeMB  = math.MaxInt64 / (1024 * 1024)
@@ -102,11 +113,18 @@ func validateJob(findings *Findings, name string, job JobConfig) {
 
 	if strings.TrimSpace(job.S3.Bucket) == "" {
 		findings.addJobError(name, base+".s3.bucket", "is required")
+	} else {
+		validateBucket(findings, name, base+".s3.bucket", job.S3.Bucket, job.S3.Endpoint != "")
 	}
 	if strings.TrimSpace(job.S3.Region) == "" {
 		findings.addJobError(name, base+".s3.region", "is required")
+	} else if len(job.S3.Region) > 63 || !regionPattern.MatchString(job.S3.Region) {
+		findings.addJobError(name, base+".s3.region", "must be a lowercase region identifier of at most 63 characters")
 	}
 	validateEndpoint(findings, name, base+".s3.endpoint", job.S3.Endpoint)
+	if !validS3Prefix(job.S3.Prefix, name) {
+		findings.addJobError(name, base+".s3.prefix", "must form a terminal-safe S3 key of at most 1024 bytes without relative path segments")
+	}
 	accessKeyID := job.S3.AccessKeyIDRef()
 	secretAccessKey := job.S3.SecretAccessKeyRef()
 	sessionToken := job.S3.SessionTokenRef()
@@ -121,6 +139,29 @@ func validateJob(findings *Findings, name string, job JobConfig) {
 	if secretConfigured(sessionToken) && (!accessConfigured || !secretKeyConfigured) {
 		findings.addJobError(name, base+".s3.session_token", "requires explicit access key ID and secret access key")
 	}
+}
+
+func validS3Prefix(prefix, jobName string) bool {
+	if !utf8.ValidString(prefix) || strings.IndexFunc(prefix, unsafeS3TextRune) >= 0 {
+		return false
+	}
+	segments := strings.FieldsFunc(prefix, func(r rune) bool { return r == '/' })
+	for _, segment := range segments {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	normalized := strings.Join(segments, "/")
+	// ObjectKey appends job/YYYY/MM/DD/job-<26-byte timestamp>.sql.gz.
+	keyLength := 2*len(jobName) + 46
+	if normalized != "" {
+		keyLength += len(normalized) + 1
+	}
+	return keyLength <= 1024
+}
+
+func unsafeS3TextRune(value rune) bool {
+	return unicode.IsControl(value) || unicode.In(value, unicode.Cf, unicode.Zl, unicode.Zp)
 }
 
 func validateAbsolutePath(findings *Findings, job, path, value string) {
@@ -143,13 +184,87 @@ func validateEndpoint(findings *Findings, job, path, endpoint string) {
 		return
 	}
 	u, err := url.ParseRequestURI(endpoint)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		findings.addJobError(job, path, "must be a complete http:// or https:// URL")
+	if err != nil || !validEndpointURL(endpoint, u) {
+		findings.addJobError(job, path, "must be an http:// or https:// URL with a valid host and no userinfo, query, fragment, or control characters")
 		return
 	}
 	if u.Scheme == "http" {
 		findings.addJobWarning(job, path, "plain HTTP endpoint configured")
 	}
+}
+
+func validateBucket(findings *Findings, job, path, bucket string, customEndpoint bool) {
+	if customEndpoint {
+		if !customBucketPattern.MatchString(bucket) || strings.Contains(bucket, "..") ||
+			strings.Contains(bucket, ".-") || strings.Contains(bucket, "-.") {
+			findings.addJobError(job, path, "must be a single 3-63 character compatible bucket name")
+		}
+		return
+	}
+	if !validAWSBucket(bucket) {
+		findings.addJobError(job, path, "must be a valid AWS S3 bucket name")
+	}
+}
+
+func validAWSBucket(bucket string) bool {
+	if !awsBucketPattern.MatchString(bucket) || strings.Contains(bucket, "..") ||
+		strings.Contains(bucket, ".-") || strings.Contains(bucket, "-.") || net.ParseIP(bucket) != nil {
+		return false
+	}
+	for _, prefix := range reservedBucketPrefix {
+		if strings.HasPrefix(bucket, prefix) {
+			return false
+		}
+	}
+	for _, suffix := range reservedBucketSuffix {
+		if strings.HasSuffix(bucket, suffix) {
+			return false
+		}
+	}
+	return true
+}
+
+func validEndpointURL(raw string, u *url.URL) bool {
+	if u == nil || !utf8.ValidString(raw) || strings.IndexFunc(raw, unicode.IsControl) >= 0 ||
+		strings.Contains(raw, "#") ||
+		u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil ||
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
+		return false
+	}
+	decodedPath, err := url.PathUnescape(u.EscapedPath())
+	if err != nil || !utf8.ValidString(decodedPath) || strings.IndexFunc(decodedPath, unicode.IsControl) >= 0 {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" || !validEndpointHost(host) {
+		return false
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return false
+	}
+	if port := u.Port(); port != "" {
+		value, err := strconv.Atoi(port)
+		if err != nil || value < 1 || value > 65535 {
+			return false
+		}
+	}
+	return true
+}
+
+func validEndpointHost(host string) bool {
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !domainLabelPattern.MatchString(label) {
+			return false
+		}
+	}
+	return true
 }
 
 func secretConfigured(secret SecretRef) bool {

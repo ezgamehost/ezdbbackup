@@ -103,7 +103,7 @@ func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []str
 			report = appendCheck(report, name, "dump_executable", "dump executable is unavailable", err)
 			state.mysqlLocal = false
 		}
-		report = appendCheck(report, name, "temp_directory", "temporary directory is not writable", v.Environment.CheckWritableTarget(job.TempDir, job.RunAs))
+		report = appendCheck(report, name, "temp_directory", "temporary directory is not writable or safe for staging", checkStagingTarget(v.Environment, job.TempDir, job.RunAs))
 		report = appendCheck(report, name, "log_directory", "log directory is not writable", v.Environment.CheckWritableTarget(cfg.Logging.Directory, job.RunAs))
 
 		if job.MySQL.PasswordFile != "" {
@@ -166,6 +166,13 @@ func checkExecutable(ctx context.Context, environment Environment, path, runAs s
 		return runAsEnvironment.CheckExecutableAs(ctx, path, runAs)
 	}
 	return environment.CheckExecutable(ctx, path)
+}
+
+func checkStagingTarget(environment Environment, path, runAs string) error {
+	if stagingEnvironment, ok := environment.(stagingTargetEnvironment); ok {
+		return stagingEnvironment.CheckStagingTarget(path, runAs)
+	}
+	return environment.CheckWritableTarget(path, runAs)
 }
 
 type jobPrerequisites struct {

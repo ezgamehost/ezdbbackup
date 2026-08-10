@@ -168,11 +168,13 @@ model.
 
 ### Custom S3 endpoints
 
-A custom endpoint must be a complete `http://` or `https://` URL. HTTPS keeps
-normal certificate verification enabled; there is no insecure-TLS switch.
-Plain HTTP is accepted for an explicitly configured private/development service
-but validation emits a warning. Services without virtual-hosted bucket routing
-usually need path-style addressing:
+A custom endpoint must be a complete `http://` or `https://` URL with a valid
+DNS/IP host. User information, queries, fragments, controls (including
+percent-encoded controls), and invalid ports are rejected; an endpoint path
+prefix is preserved. HTTPS keeps normal certificate verification enabled;
+there is no insecure-TLS switch. Plain HTTP is accepted for an explicitly
+configured private/development service but validation emits a warning. Services
+without virtual-hosted bucket routing usually need path-style addressing:
 
 ```yaml
 s3:
@@ -185,8 +187,27 @@ s3:
   secret_access_key_file: /etc/ezdbbackup/secrets/s3-secret-access-key
 ```
 
-Uploads use the AWS SDK retry behavior. Because the gzip is completely staged
-before upload, an upload retry does not rerun `mysqldump`.
+Without a custom endpoint, bucket names use AWS's 3-63 character DNS-compatible
+grammar and reserved AWS prefixes/suffixes are rejected. Custom endpoints use a
+conservative single-segment ASCII bucket grammar (uppercase and `_` are also
+accepted). Regions are bounded lowercase identifiers without empty components.
+Prefixes must be valid terminal-safe UTF-8, contain no relative `.`/`..`
+segments, and leave the generated object key within S3's 1024-byte limit.
+
+Uploads use the AWS SDK retry behavior. Files up to 8 MiB use `PutObject`;
+larger files use ordered multipart upload with seekable bounded parts. Part size
+grows automatically when necessary to remain within S3's 10,000-part limit.
+Every failure after multipart creation attempts `AbortMultipartUpload` with a
+fresh 30-second context, including when the original request was canceled.
+Because the gzip is completely staged before upload, an upload retry does not
+rerun `mysqldump`.
+
+Human-facing S3 errors contain only a fixed operation name plus vetted API code,
+HTTP status, and request/host IDs only when the standard AWS endpoint boundary
+can trust them. Custom endpoint response IDs are omitted and their API codes use
+a fixed S3 allowlist. Raw endpoint messages, bodies, headers, URLs, signatures,
+and credential material are not printed or logged; the wrapped SDK error remains
+available to programmatic callers.
 
 ## Commands and exit codes
 
@@ -231,8 +252,10 @@ Default validation is local and side-effect free. It validates the complete
 schema and cron-safe paths; checks `run_as`; verifies the configured dump
 binary is regular, traversable and executable; invokes it with `--version`;
 checks staging/log directory writability; and checks file-backed secrets. A
-missing staging or log directory is not created: validation checks whether
-`run_as` could create it beneath the nearest existing parent.
+shared writable staging target or ancestor must be sticky (as `/tmp` normally
+is), and existing path ancestors must be owned by `run_as` or root. A missing
+staging or log directory is not created: validation checks whether `run_as`
+could create it beneath the nearest existing parent.
 
 `--connectivity` adds a no-data/no-DDL MySQL probe and S3 `HeadBucket`. MySQL
 and S3 are reported separately. `HeadBucket` can be denied by a policy that
@@ -330,17 +353,27 @@ owners can race or defeat the built-in retention policy.
 
 ## Staging, cleanup, and object keys
 
-Each job first writes one gzip file named like `ezdbbackup-*.sql.gz` in its
-`temp_dir`. The file is mode `0600` and is complete before S3 upload starts.
-Allow enough free space for the largest complete compressed dump plus filesystem
-overhead. `backup --all` is sequential, so jobs do not intentionally stage in
-parallel within one process; separate manual/cron invocations can still overlap.
+Each job creates a unique mode-`0700` directory named like
+`ezdbbackup-<random>` beneath `temp_dir`, then writes `backup.sql.gz` inside it
+with mode `0600`. The file is complete before S3 upload starts. Allow enough
+free space for the largest complete compressed dump plus filesystem overhead.
+`backup --all` is sequential, so jobs do not intentionally stage in parallel
+within one process; separate manual/cron invocations can still overlap.
 
-The staged file is removed after successful upload and on dump, compression,
-finalization, client creation, and upload failure paths. A partial staging file
-is removed when staging fails. A cleanup failure is logged; if it is the only
-failure, the job fails. Monitor the staging directory for residue after crashes
-or forced termination, which cannot execute process cleanup handlers.
+Staging records the parent/work-directory and file device, inode, size, type,
+mode, and link identity. Before upload, the file is reopened relative to the
+recorded directory with symlink following disabled; only an exact regular,
+single-link identity is accepted, and upload reads that verified descriptor.
+Cleanup likewise removes only the original identity. If a path was replaced,
+relinked, resized, or permission-broadened, the replacement is left untouched
+and a cleanup safety error is reported.
+
+The staged file and private work directory are removed after successful upload
+and on dump, compression, finalization, client creation, and upload failure
+paths. A partial staging file and its work directory are removed when staging
+fails. A cleanup failure is logged; if it is the only failure, the job fails.
+Monitor the staging directory for residue after crashes or forced termination,
+which cannot execute process cleanup handlers.
 
 Object keys use the backup start time in UTC with nanosecond precision:
 

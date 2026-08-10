@@ -149,6 +149,10 @@ func (s *Service) Run(ctx context.Context, jobName string, job config.JobConfig)
 	if storeErr != nil {
 		return Result{}, stageError("s3_upload", storeErr, secrets...)
 	}
+	file, openErr := s.Stager.Open(artifact)
+	if openErr != nil {
+		return Result{}, stageError("temporary_storage", openErr, secrets...)
+	}
 	objectKey := storage.ObjectKey(job.S3.Prefix, jobName, started)
 	s.write(logging.Event{
 		Time:    clock(),
@@ -159,8 +163,13 @@ func (s *Service) Run(ctx context.Context, jobName string, job config.JobConfig)
 		Stage:   "s3_upload",
 		Fields:  map[string]any{"object_key": objectKey, "size": artifact.Size},
 	})
-	if _, uploadErr := store.UploadFile(ctx, job.S3.Bucket, objectKey, artifact.Path); uploadErr != nil {
+	_, uploadErr := store.UploadFile(ctx, job.S3.Bucket, objectKey, file, artifact.Size)
+	closeErr := file.Close()
+	if uploadErr != nil {
 		return Result{}, stageError("s3_upload", uploadErr, secrets...)
+	}
+	if closeErr != nil {
+		return Result{}, stageError("temporary_storage", closeErr, secrets...)
 	}
 
 	result = Result{Job: jobName, ObjectKey: objectKey, Size: artifact.Size}
