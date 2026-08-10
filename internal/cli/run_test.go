@@ -3,6 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -23,6 +26,35 @@ func TestVersion(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestReleaseBuildPrintsInjectedVersion(t *testing.T) {
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate CLI test source")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(filename), "..", ".."))
+	binaryPath := filepath.Join(t.TempDir(), "ezdbbackup")
+
+	build := exec.Command(
+		"go", "build",
+		"-ldflags=-X github.com/ezgamehost/ezdbbackup/internal/buildinfo.Version=v9.9.9-test",
+		"-o", binaryPath,
+		"./cmd/ezdbbackup",
+	)
+	build.Dir = repositoryRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build release binary: %v\n%s", err, output)
+	}
+
+	command := exec.Command(binaryPath, "version")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run release binary: %v\n%s", err, output)
+	}
+	if got, want := string(output), "ezdbbackup v9.9.9-test\n"; got != want {
+		t.Fatalf("version output = %q, want %q", got, want)
 	}
 }
 

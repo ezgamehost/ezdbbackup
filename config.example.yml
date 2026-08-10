@@ -1,0 +1,72 @@
+# ezdbbackup accepts exactly one YAML document and rejects unknown or duplicate
+# fields. Copy this file to /etc/ezdbbackup/config.yml and adjust every example
+# name and path for the target host.
+version: 1
+
+defaults:
+  dump_binary: /usr/bin/mysqldump
+  temp_dir: /var/lib/ezdbbackup/tmp
+
+logging:
+  directory: /var/log/ezdbbackup
+  debug: false
+  rotation:
+    max_size_mb: 100
+    max_files: 7
+    max_age_days: 30
+    compress: true
+
+jobs:
+  production:
+    enabled: true
+    schedule: "0 2 * * *"
+    run_as: ezdbbackup
+
+    mysql:
+      host: mysql.example.invalid
+      port: 3306
+      user: backup
+      password_file: /etc/ezdbbackup/secrets/production-mysql-password
+      # Use a non-empty YAML list to dump only the named databases.
+      databases:
+        - application
+        - analytics
+      extra_args:
+        - --single-transaction
+        - --quick
+
+    s3:
+      bucket: example-production-database-backups
+      prefix: mysql/production
+      region: us-east-1
+      force_path_style: false
+      # No explicit S3 credential fields: the AWS SDK default credential chain
+      # is used (for example, environment/shared config/container/instance role).
+
+  archive-compatible:
+    enabled: true
+    schedule: "30 3 * * *"
+    run_as: ezdbbackup
+
+    mysql:
+      host: archive-mysql.example.invalid
+      port: 3306
+      user: backup
+      password_file: /etc/ezdbbackup/secrets/archive-mysql-password
+      # The exact scalar `all` selects --all-databases. It is not a list item.
+      databases: all
+      extra_args:
+        - --single-transaction
+        - --quick
+
+    s3:
+      bucket: example-archive-database-backups
+      prefix: mysql/archive
+      region: us-east-1
+      endpoint: https://objects.example.invalid
+      force_path_style: true
+      # Explicit S3 credentials are resolved from these fictional absolute
+      # paths. Never put real credential values in an example configuration.
+      access_key_id_file: /etc/ezdbbackup/secrets/archive-s3-access-key-id
+      secret_access_key_file: /etc/ezdbbackup/secrets/archive-s3-secret-access-key
+      session_token_file: /etc/ezdbbackup/secrets/archive-s3-session-token

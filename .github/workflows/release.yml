@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build, inspect, and package static Linux binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME}"
+          if [[ ! "${version}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+            echo "unsupported release tag for artifact names: ${version}" >&2
+            exit 1
+          fi
+
+          mkdir -p dist
+          package_root="$(mktemp -d)"
+          trap 'rm -rf -- "${package_root}"' EXIT
+
+          for arch in amd64 arm64; do
+            package_dir="${package_root}/linux_${arch}"
+            mkdir -p "${package_dir}"
+
+            binary="${package_dir}/ezdbbackup"
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build \
+              -trimpath \
+              -ldflags="-s -w -X github.com/ezgamehost/ezdbbackup/internal/buildinfo.Version=${version}" \
+              -o "${binary}" \
+              ./cmd/ezdbbackup
+
+            file_output="$(file "${binary}")"
+            echo "${file_output}"
+            if [[ "${file_output}" != *"Linux"* || "${file_output}" != *"statically linked"* ]]; then
+              echo "release binary is not a static Linux executable: ${binary}" >&2
+              exit 1
+            fi
+
+            set +e
+            ldd_output="$(ldd "${binary}" 2>&1)"
+            ldd_status=$?
+            set -e
+            echo "${ldd_output}"
+            if (( ldd_status == 0 )) || [[ "${ldd_output}" == *"=>"* ]]; then
+              echo "dynamic dependency reported for ${binary}" >&2
+              exit 1
+            fi
+            if [[ "${ldd_output}" != *"not a dynamic executable"* && "${ldd_output}" != *"statically linked"* ]]; then
+              echo "unexpected ldd result for ${binary} (status ${ldd_status})" >&2
+              exit 1
+            fi
+
+            install -m 0644 README.md config.example.yml "${package_dir}/"
+            archive="dist/ezdbbackup_${version}_linux_${arch}.tar.gz"
+            tar -C "${package_dir}" -czf "${archive}" \
+              ezdbbackup README.md config.example.yml
+          done
+
+          (
+            cd dist
+            sha256sum ezdbbackup_*.tar.gz > SHA256SUMS
+          )
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
