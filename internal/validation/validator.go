@@ -176,6 +176,7 @@ type jobPrerequisites struct {
 }
 
 func (v Validator) checkConnectivity(ctx context.Context, report Report, name string, job config.JobConfig, state jobPrerequisites) Report {
+	secrets := configuredSecretValues(job)
 	if !state.mysqlConfig {
 		report = report.Append(skippedFinding(name, "mysql_connectivity", "skipped because MySQL configuration prerequisites failed"))
 	} else if !state.mysqlLocal {
@@ -185,9 +186,10 @@ func (v Validator) checkConnectivity(ctx context.Context, report Report, name st
 	} else {
 		request, err := v.Resolve.Dump(job)
 		if err != nil {
-			report = appendCheck(report, name, "mysql_connectivity", "resolve MySQL probe options", err)
+			report = appendCheck(report, name, "mysql_connectivity", "resolve MySQL probe options", redactCause(err, secrets...))
 		} else {
-			report = appendCheck(report, name, "mysql_connectivity", "MySQL connection probe failed", v.Dump.Probe(ctx, request))
+			secrets = appendNonEmpty(secrets, request.Password)
+			report = appendCheck(report, name, "mysql_connectivity", "MySQL connection probe failed", redactCause(v.Dump.Probe(ctx, request), secrets...))
 		}
 	}
 
@@ -202,18 +204,34 @@ func (v Validator) checkConnectivity(ctx context.Context, report Report, name st
 	}
 	storeOptions, err := v.Resolve.Storage(job)
 	if err != nil {
-		return appendCheck(report, name, "s3_connectivity", "resolve S3 client options", err)
+		return appendCheck(report, name, "s3_connectivity", "resolve S3 client options", redactCause(err, secrets...))
 	}
+	secrets = appendNonEmpty(
+		secrets,
+		storeOptions.Credentials.AccessKeyID,
+		storeOptions.Credentials.SecretAccessKey,
+		storeOptions.Credentials.SessionToken,
+	)
 	store, err := v.Stores.New(ctx, storeOptions)
 	if err != nil {
-		return appendCheck(report, name, "s3_connectivity", "create S3 client", err)
+		return appendCheck(report, name, "s3_connectivity", "create S3 client", redactCause(err, secrets...))
 	}
 	return appendCheck(
 		report,
 		name,
 		"s3_connectivity",
 		"S3 bucket inspection failed; bucket inspection may be denied even when uploads are allowed",
-		store.Probe(ctx, job.S3.Bucket),
+		redactCause(store.Probe(ctx, job.S3.Bucket), secrets...),
+	)
+}
+
+func configuredSecretValues(job config.JobConfig) []string {
+	return appendNonEmpty(
+		nil,
+		job.MySQL.Password,
+		job.S3.AccessKeyID,
+		job.S3.SecretAccessKey,
+		job.S3.SessionToken,
 	)
 }
 

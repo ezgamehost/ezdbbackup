@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"math"
+	"testing"
+	"time"
+)
 
 func validConfig() *Config {
 	return &Config{
@@ -118,5 +122,43 @@ func TestValidateWarnsForPlainHTTPEndpoint(t *testing.T) {
 	}
 	if findings.HasErrors() {
 		t.Fatalf("unexpected errors: %v", findings)
+	}
+}
+
+func TestValidateRotationConversionBounds(t *testing.T) {
+	maxSizeMB := int(math.MaxInt64 / (1024 * 1024))
+	maxAgeDays := int(math.MaxInt64 / int64(24*time.Hour))
+	for _, tt := range []struct {
+		name     string
+		sizeMB   int
+		ageDays  int
+		wantPath string
+	}{
+		{name: "maximum size", sizeMB: maxSizeMB, ageDays: 1},
+		{name: "maximum age", sizeMB: 1, ageDays: maxAgeDays},
+		{name: "size overflow", sizeMB: maxSizeMB + 1, ageDays: 1, wantPath: "logging.rotation.max_size_mb"},
+		{name: "age overflow", sizeMB: 1, ageDays: maxAgeDays + 1, wantPath: "logging.rotation.max_age_days"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Logging.Rotation.MaxSizeMB = tt.sizeMB
+			cfg.Logging.Rotation.MaxAgeDays = tt.ageDays
+			findings := Validate(cfg)
+			if tt.wantPath == "" {
+				if findings.HasErrors() {
+					t.Fatalf("Validate() findings = %v, want boundary accepted", findings)
+				}
+				return
+			}
+			found := false
+			for _, finding := range findings {
+				if finding.Path == tt.wantPath {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("Validate() findings = %v, want %s overflow", findings, tt.wantPath)
+			}
+		})
 	}
 }

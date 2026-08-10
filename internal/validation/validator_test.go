@@ -137,6 +137,69 @@ func TestValidatorConnectivityChecksMySQLAndS3SeparatelyAndContinues(t *testing.
 	}
 }
 
+func TestValidatorConnectivityRedactsResolvedSecretsAndPreservesCauses(t *testing.T) {
+	const (
+		password = "mysql-password"
+		access   = "overlap"
+		secret   = "overlap-secret"
+		session  = "session-token"
+	)
+	for _, target := range []string{"dump", "factory", "store"} {
+		t.Run(target, func(t *testing.T) {
+			cfg := validValidationConfig()
+			job := validValidationJob("alpha", true)
+			job.MySQL.PasswordFile = ""
+			job.MySQL.Password = password
+			job.S3.AccessKeyIDFile = ""
+			job.S3.SecretAccessKeyFile = ""
+			job.S3.SessionTokenFile = ""
+			job.S3.AccessKeyID = access
+			job.S3.SecretAccessKey = secret
+			job.S3.SessionToken = session
+			cfg.Jobs["alpha"] = job
+			cause := &typedConnectivityError{text: strings.Join([]string{password, access, secret, session}, "|")}
+			remote := &secretConnectivityDependencies{target: target, cause: cause}
+			validator := Validator{
+				Environment: &fakeEnvironment{},
+				Resolve:     remote,
+				Dump:        remote,
+				Stores:      remote,
+				CurrentUser: &fakeCurrentUser{name: job.RunAs},
+			}
+
+			report := validator.Check(context.Background(), cfg, []string{"alpha"}, Options{
+				Connectivity: true,
+				BinaryPath:   "/bin/ezdbbackup",
+				ConfigPath:   "/etc/ezdbbackup/config.yml",
+			})
+
+			finding := findFindingWithMessage(report, "alpha", map[string]string{
+				"dump": "mysql_connectivity", "factory": "s3_connectivity", "store": "s3_connectivity",
+			}[target], "")
+			if finding == nil || finding.Cause == nil {
+				t.Fatalf("findings = %#v, want connectivity cause", report.Findings)
+			}
+			for _, exposed := range []string{finding.Error(), finding.Cause.Error()} {
+				for _, value := range []string{password, access, secret, session} {
+					if strings.Contains(exposed, value) {
+						t.Fatalf("%s finding exposed %q: %q", target, value, exposed)
+					}
+				}
+				if !strings.Contains(exposed, "[REDACTED]") {
+					t.Fatalf("%s finding = %q, want redaction marker", target, exposed)
+				}
+			}
+			if !errors.Is(finding, cause) {
+				t.Fatal("redacted finding does not preserve errors.Is identity")
+			}
+			var typed *typedConnectivityError
+			if !errors.As(finding, &typed) || typed != cause {
+				t.Fatal("redacted finding does not preserve errors.As type")
+			}
+		})
+	}
+}
+
 func TestValidatorConnectivityWarnsWhenInvokingUserDiffersAndStillProbes(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -439,6 +502,59 @@ func (s fakeStore) Probe(_ context.Context, bucket string) error {
 	call := "store-probe:" + bucket
 	s.owner.record(call)
 	return s.owner.errors[call]
+}
+
+type typedConnectivityError struct{ text string }
+
+func (e *typedConnectivityError) Error() string { return e.text }
+
+type secretConnectivityDependencies struct {
+	target string
+	cause  error
+}
+
+func (d *secretConnectivityDependencies) Dump(job config.JobConfig) (dump.Request, error) {
+	return dump.Request{Host: job.MySQL.Host, Password: job.MySQL.Password}, nil
+}
+
+func (d *secretConnectivityDependencies) Storage(job config.JobConfig) (storage.Options, error) {
+	return storage.Options{Region: job.S3.Region, Credentials: storage.Credentials{
+		AccessKeyID: job.S3.AccessKeyID, SecretAccessKey: job.S3.SecretAccessKey,
+		SessionToken: job.S3.SessionToken, Explicit: true,
+	}}, nil
+}
+
+func (*secretConnectivityDependencies) Run(context.Context, dump.Request, io.Writer) error {
+	return errors.New("Run must not be used by validation")
+}
+
+func (d *secretConnectivityDependencies) Probe(context.Context, dump.Request) error {
+	if d.target == "dump" {
+		return d.cause
+	}
+	return nil
+}
+
+func (d *secretConnectivityDependencies) New(context.Context, storage.Options) (storage.Store, error) {
+	if d.target == "factory" {
+		return nil, d.cause
+	}
+	return secretConnectivityStore{owner: d}, nil
+}
+
+type secretConnectivityStore struct {
+	owner *secretConnectivityDependencies
+}
+
+func (secretConnectivityStore) UploadFile(context.Context, string, string, string) (storage.UploadResult, error) {
+	return storage.UploadResult{}, errors.New("UploadFile must not be used by validation")
+}
+
+func (s secretConnectivityStore) Probe(context.Context, string) error {
+	if s.owner.target == "store" {
+		return s.owner.cause
+	}
+	return nil
 }
 
 type recordingResolver struct {

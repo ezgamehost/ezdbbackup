@@ -32,12 +32,33 @@ func TestLogOptionsMapsConfiguredRotationAndInvocationDebug(t *testing.T) {
 			Compress:     true,
 		},
 	}
-	if got := logOptions(configured, true); !reflect.DeepEqual(got, want) {
+	got, err := logOptions(configured, true)
+	if err != nil {
+		t.Fatalf("logOptions() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("logOptions() = %#v, want %#v", got, want)
 	}
 	configured.Debug = true
-	if got := logOptions(configured, false); !got.Debug {
+	got, err = logOptions(configured, false)
+	if err != nil {
+		t.Fatalf("logOptions() configured debug error = %v", err)
+	}
+	if !got.Debug {
 		t.Fatal("configured debug was disabled by invocation options")
+	}
+}
+
+func TestLogOptionsRejectsOverflow(t *testing.T) {
+	maxSizeMB := int(^uint64(0)>>1) / (1024 * 1024)
+	maxAgeDays := int(^uint64(0)>>1) / int(24*time.Hour)
+	for _, configured := range []config.LoggingConfig{
+		{Rotation: config.RotationConfig{MaxSizeMB: maxSizeMB + 1, MaxAgeDays: 1}},
+		{Rotation: config.RotationConfig{MaxSizeMB: 1, MaxAgeDays: maxAgeDays + 1}},
+	} {
+		if _, err := logOptions(configured, false); err == nil {
+			t.Fatalf("logOptions(%+v) error = nil, want overflow", configured.Rotation)
+		}
 	}
 }
 

@@ -2,10 +2,12 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/robfig/cron/v3"
 )
@@ -13,6 +15,11 @@ import (
 var jobNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 
 var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+
+const (
+	maxRotationSizeMB  = math.MaxInt64 / (1024 * 1024)
+	maxRotationAgeDays = math.MaxInt64 / int64(24*time.Hour)
+)
 
 // Validate performs configuration-only checks without accessing the network,
 // filesystem, or local user database.
@@ -30,12 +37,16 @@ func Validate(cfg *Config) Findings {
 	validateAbsolutePath(&findings, "logging.directory", cfg.Logging.Directory)
 	if cfg.Logging.Rotation.MaxSizeMB <= 0 {
 		findings.addError("logging.rotation.max_size_mb", "must be greater than zero")
+	} else if int64(cfg.Logging.Rotation.MaxSizeMB) > maxRotationSizeMB {
+		findings.addError("logging.rotation.max_size_mb", fmt.Sprintf("must not exceed %d", maxRotationSizeMB))
 	}
 	if cfg.Logging.Rotation.MaxFiles <= 0 {
 		findings.addError("logging.rotation.max_files", "must be greater than zero")
 	}
 	if cfg.Logging.Rotation.MaxAgeDays <= 0 {
 		findings.addError("logging.rotation.max_age_days", "must be greater than zero")
+	} else if int64(cfg.Logging.Rotation.MaxAgeDays) > maxRotationAgeDays {
+		findings.addError("logging.rotation.max_age_days", fmt.Sprintf("must not exceed %d", maxRotationAgeDays))
 	}
 
 	for _, name := range cfg.JobNames() {

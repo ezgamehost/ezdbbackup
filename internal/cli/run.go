@@ -88,8 +88,12 @@ func parseInterspersed(flags *flag.FlagSet, args []string, valueFlags map[string
 			name = name[:equals]
 		}
 		if valueFlags[name] && !strings.ContainsRune(arg, '=') && index+1 < len(args) {
+			next := args[index+1]
+			if strings.HasPrefix(next, "-") {
+				return flags.Parse([]string{arg})
+			}
 			index++
-			ordered = append(ordered, args[index])
+			ordered = append(ordered, next)
 		}
 	}
 	ordered = append(ordered, positionals...)

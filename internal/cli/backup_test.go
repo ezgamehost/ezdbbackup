@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ezgamehost/ezdbbackup/internal/backup"
 	"github.com/ezgamehost/ezdbbackup/internal/config"
@@ -62,6 +63,56 @@ func TestBackupAcceptsFlagsBeforeAndAfterJob(t *testing.T) {
 				t.Fatalf("dump jobs = %v", runtime.dumps)
 			}
 		})
+	}
+}
+
+func TestBackupRejectsMissingConfigValueBeforeLoading(t *testing.T) {
+	for _, args := range [][]string{
+		{"backup", "--config", "--debug", "alpha"},
+		{"backup", "alpha", "--config", "--debug"},
+		{"backup", "--config", "--", "alpha"},
+		{"backup", "alpha", "--config", "--"},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			deps := fakeDependencies(&stdout, &stderr)
+			loads := 0
+			deps.LoadConfig = func(string) (*config.Config, config.Findings) {
+				loads++
+				return cliTestConfig("alpha"), nil
+			}
+			deps.Validator = &recordingValidator{}
+			deps.NewBackup = (&backupRuntime{}).newService
+
+			if code := Run(context.Background(), args, deps); code != 2 {
+				t.Fatalf("code = %d, want 2", code)
+			}
+			if loads != 0 {
+				t.Fatalf("config loads = %d, want zero", loads)
+			}
+			if !strings.Contains(stderr.String(), "flag needs an argument") {
+				t.Fatalf("stderr = %q", stderr.String())
+			}
+		})
+	}
+}
+
+func TestBackupAllowsExplicitEqualsForFlagLikeConfigValue(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	deps := fakeDependencies(&stdout, &stderr)
+	var loaded string
+	deps.LoadConfig = func(path string) (*config.Config, config.Findings) {
+		loaded = path
+		return cliTestConfig("alpha"), nil
+	}
+	deps.Validator = &recordingValidator{}
+	deps.NewBackup = (&backupRuntime{}).newService
+
+	if code := Run(context.Background(), []string{"backup", "alpha", "--config=--debug"}, deps); code != 0 {
+		t.Fatalf("code = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.HasSuffix(loaded, "/--debug") {
+		t.Fatalf("loaded path = %q, want explicit flag-like value", loaded)
 	}
 }
 
@@ -196,6 +247,30 @@ func TestBackupLoggerFailureExitsOneBeforeDump(t *testing.T) {
 	}
 }
 
+func TestBackupLoggingConversionOverflowExitsTwoBeforeLogger(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	deps := fakeDependencies(&stdout, &stderr)
+	cfg := cliTestConfig("alpha")
+	cfg.Logging.Rotation.MaxAgeDays = int(^uint64(0)>>1)/int(24*time.Hour) + 1
+	deps.LoadConfig = func(string) (*config.Config, config.Findings) { return cfg, nil }
+	deps.Validator = &recordingValidator{}
+	loggerCalls := 0
+	deps.NewLogger = func(logging.Options) (logging.Sink, error) {
+		loggerCalls++
+		return discardSink{}, nil
+	}
+
+	if code := Run(context.Background(), []string{"backup", "alpha"}, deps); code != 2 {
+		t.Fatalf("code = %d, stderr = %q", code, stderr.String())
+	}
+	if loggerCalls != 0 {
+		t.Fatalf("logger calls = %d, want zero", loggerCalls)
+	}
+	if !strings.Contains(stderr.String(), "logging") || !strings.Contains(stderr.String(), "overflow") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
 func TestBackupAllRunsLexicallyContinuesAndSummarizes(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	deps := fakeDependencies(&stdout, &stderr)
@@ -225,10 +300,49 @@ func TestBackupAllRunsLexicallyContinuesAndSummarizes(t *testing.T) {
 	}
 }
 
+func TestBackupAllWithNoEnabledJobsHasNoValidationOrBackupEffects(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	deps := fakeDependencies(&stdout, &stderr)
+	cfg := cliTestConfig("disabled")
+	disabled := cfg.Jobs["disabled"]
+	disabled.Enabled = false
+	cfg.Jobs["disabled"] = disabled
+	deps.LoadConfig = func(string) (*config.Config, config.Findings) { return cfg, nil }
+	validatorCalls, loggerCalls, backupCalls := 0, 0, 0
+	deps.Validator = checkerFunc(func(context.Context, *config.Config, []string, validation.Options) validation.Report {
+		validatorCalls++
+		return validation.Report{}
+	})
+	deps.NewLogger = func(logging.Options) (logging.Sink, error) {
+		loggerCalls++
+		return discardSink{}, nil
+	}
+	deps.NewBackup = func(logging.Sink) *backup.Service {
+		backupCalls++
+		return (&backupRuntime{}).newService(discardSink{})
+	}
+
+	if code := Run(context.Background(), []string{"backup", "--all"}, deps); code != 0 {
+		t.Fatalf("code = %d, stderr = %q", code, stderr.String())
+	}
+	if validatorCalls != 0 || loggerCalls != 0 || backupCalls != 0 {
+		t.Fatalf("effects = validator:%d logger:%d backup:%d", validatorCalls, loggerCalls, backupCalls)
+	}
+	if got := stdout.String(); got != "backup summary: 0 succeeded, 0 failed\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
 type recordingValidator struct {
 	jobs    []string
 	options validation.Options
 	report  validation.Report
+}
+
+type checkerFunc func(context.Context, *config.Config, []string, validation.Options) validation.Report
+
+func (f checkerFunc) Check(ctx context.Context, cfg *config.Config, jobs []string, options validation.Options) validation.Report {
+	return f(ctx, cfg, jobs, options)
 }
 
 func (v *recordingValidator) Check(_ context.Context, _ *config.Config, jobs []string, options validation.Options) validation.Report {

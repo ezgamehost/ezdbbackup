@@ -57,6 +57,10 @@ func runBackup(ctx context.Context, args []string, deps Dependencies) int {
 		}
 		selected = []string{name}
 	}
+	if *all && len(selected) == 0 {
+		printBackupSummary(backup.Summary{}, deps)
+		return 0
+	}
 
 	binaryPath, err := executablePath(deps)
 	if err != nil {
@@ -71,7 +75,12 @@ func runBackup(ctx context.Context, args []string, deps Dependencies) int {
 		return 2
 	}
 
-	logger, err := deps.NewLogger(logOptions(cfg.Logging, *debug))
+	options, err := logOptions(cfg.Logging, *debug)
+	if err != nil {
+		fmt.Fprintf(deps.Stderr, "backup: invalid logging configuration: %v\n", err)
+		return 2
+	}
+	logger, err := deps.NewLogger(options)
 	if err != nil {
 		fmt.Fprintf(deps.Stderr, "backup: initialize logging: %v\n", err)
 		return 1
