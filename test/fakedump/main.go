@@ -13,7 +13,7 @@ func main() {
 		}
 	}
 	if os.Getenv("FAKE_DUMP_FAIL") == "1" {
-		fmt.Fprintln(os.Stderr, "forced dump failure")
+		fmt.Fprintf(os.Stderr, "forced dump failure: %s\n", os.Getenv("MYSQL_PWD"))
 		os.Exit(9)
 	}
 	fmt.Println("CREATE TABLE example(id INT);")

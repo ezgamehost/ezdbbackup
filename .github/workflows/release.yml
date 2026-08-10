@@ -43,6 +43,11 @@ jobs:
             package_dir="${package_root}/linux_${arch}"
             mkdir -p "${package_dir}"
 
+            case "${arch}" in
+              amd64) file_arch="x86-64" ;;
+              arm64) file_arch="ARM aarch64" ;;
+            esac
+
             binary="${package_dir}/ezdbbackup"
             CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build \
               -trimpath \
@@ -52,8 +57,10 @@ jobs:
 
             file_output="$(file "${binary}")"
             echo "${file_output}"
-            if [[ "${file_output}" != *"Linux"* || "${file_output}" != *"statically linked"* ]]; then
-              echo "release binary is not a static Linux executable: ${binary}" >&2
+            if [[ "${file_output}" != *"ELF 64-bit LSB executable"* ||
+                  "${file_output}" != *"${file_arch}"* ||
+                  "${file_output}" != *"statically linked"* ]]; then
+              echo "release binary is not a static ${arch} Linux ELF executable: ${binary}" >&2
               exit 1
             fi
 

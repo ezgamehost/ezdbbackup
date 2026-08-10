@@ -10,8 +10,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -19,6 +24,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -118,6 +124,191 @@ func TestBackupToS3(t *testing.T) {
 	assertNoStagedBackup(t, stageDirectory)
 }
 
+func TestBackupDumpFailureIsLoggedAndCleaned(t *testing.T) {
+	endpoint := os.Getenv("EZDBBACKUP_TEST_S3_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("integration test requires EZDBBACKUP_TEST_S3_ENDPOINT (for example http://127.0.0.1:4566)")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	t.Cleanup(cancel)
+
+	repository := repositoryRoot(t)
+	temporary := t.TempDir()
+	backupBinary := filepath.Join(temporary, "ezdbbackup")
+	fakeDumpBinary := filepath.Join(temporary, "mysqldump-fake")
+	buildBinary(t, ctx, repository, backupBinary, "./cmd/ezdbbackup")
+	buildBinary(t, ctx, repository, fakeDumpBinary, "./test/fakedump")
+
+	stageDirectory := filepath.Join(temporary, "stage")
+	logDirectory := filepath.Join(temporary, "logs")
+	for _, directory := range []string{stageDirectory, logDirectory} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatalf("create integration directory %q: %v", directory, err)
+		}
+	}
+
+	currentUser, err := user.Current()
+	if err != nil {
+		t.Fatalf("look up current user: %v", err)
+	}
+	bucket := integrationBucket(temporary)
+	client := newS3Client(t, ctx, endpoint)
+	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("create integration bucket: %v", err)
+	}
+	t.Cleanup(func() { cleanBucket(t, client, bucket) })
+
+	const password = "binary-e2e-mysql-secret"
+	configPath := filepath.Join(temporary, "config.yml")
+	writeConfig(t, configPath, integrationConfig{
+		Bucket:         bucket,
+		DumpBinary:     fakeDumpBinary,
+		Endpoint:       endpoint,
+		LogDirectory:   logDirectory,
+		Password:       password,
+		RunAs:          currentUser.Username,
+		StageDirectory: stageDirectory,
+	})
+
+	runCLI(t, ctx, backupBinary, "validate", "--all", "--connectivity", "--config", configPath)
+	output, exitCode := runCLIWithEnvironment(
+		t,
+		ctx,
+		backupBinary,
+		map[string]string{"FAKE_DUMP_FAIL": "1"},
+		"backup", "production", "--config", configPath,
+	)
+	if exitCode != 1 {
+		t.Fatalf("backup exit code = %d, want 1\n%s", exitCode, output)
+	}
+	if bytes.Contains(output, []byte(password)) {
+		t.Fatalf("backup output exposed MySQL password: %s", output)
+	}
+
+	objects, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
+	if err != nil {
+		t.Fatalf("list integration objects: %v", err)
+	}
+	if len(objects.Contents) != 0 {
+		t.Fatalf("object count after dump failure = %d, want 0", len(objects.Contents))
+	}
+	assertNoStagedBackup(t, stageDirectory)
+	assertDumpFailureLog(t, logDirectory, password)
+}
+
+func TestBackupRetriesTransientS3Upload(t *testing.T) {
+	endpoint := os.Getenv("EZDBBACKUP_TEST_S3_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("integration test requires EZDBBACKUP_TEST_S3_ENDPOINT (for example http://127.0.0.1:4566)")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	t.Cleanup(cancel)
+
+	repository := repositoryRoot(t)
+	temporary := t.TempDir()
+	backupBinary := filepath.Join(temporary, "ezdbbackup")
+	fakeDumpBinary := filepath.Join(temporary, "mysqldump-fake")
+	buildBinary(t, ctx, repository, backupBinary, "./cmd/ezdbbackup")
+	buildBinary(t, ctx, repository, fakeDumpBinary, "./test/fakedump")
+
+	stageDirectory := filepath.Join(temporary, "stage")
+	logDirectory := filepath.Join(temporary, "logs")
+	for _, directory := range []string{stageDirectory, logDirectory} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatalf("create integration directory %q: %v", directory, err)
+		}
+	}
+
+	currentUser, err := user.Current()
+	if err != nil {
+		t.Fatalf("look up current user: %v", err)
+	}
+	bucket := integrationBucket(temporary)
+	directClient := newS3Client(t, ctx, endpoint)
+	if _, err := directClient.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("create integration bucket: %v", err)
+	}
+	t.Cleanup(func() { cleanBucket(t, directClient, bucket) })
+
+	proxy, uploadAttempts := newTransientUploadProxy(t, endpoint, bucket)
+	configPath := filepath.Join(temporary, "config.yml")
+	writeConfig(t, configPath, integrationConfig{
+		Bucket:         bucket,
+		DumpBinary:     fakeDumpBinary,
+		Endpoint:       proxy.URL,
+		LogDirectory:   logDirectory,
+		RunAs:          currentUser.Username,
+		StageDirectory: stageDirectory,
+	})
+
+	runCLI(t, ctx, backupBinary, "validate", "--all", "--connectivity", "--config", configPath)
+	if got := uploadAttempts.Load(); got != 0 {
+		t.Fatalf("upload attempts after setup and connectivity = %d, want 0", got)
+	}
+	runCLI(t, ctx, backupBinary, "backup", "production", "--config", configPath)
+	if got := uploadAttempts.Load(); got < 2 {
+		t.Fatalf("upload attempts = %d, want at least 2 after one transient failure", got)
+	}
+
+	objects, err := directClient.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
+	if err != nil {
+		t.Fatalf("list integration objects: %v", err)
+	}
+	if len(objects.Contents) != 1 {
+		t.Fatalf("object count = %d, want exactly 1", len(objects.Contents))
+	}
+	object, err := directClient.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    objects.Contents[0].Key,
+	})
+	if err != nil {
+		t.Fatalf("fetch integration object: %v", err)
+	}
+	compressed, readErr := io.ReadAll(io.LimitReader(object.Body, 1<<20))
+	closeErr := object.Body.Close()
+	if readErr != nil {
+		t.Fatalf("read integration object: %v", readErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("close integration object: %v", closeErr)
+	}
+	if got := gunzip(t, compressed); got != wantSQL {
+		t.Fatalf("decompressed SQL = %q, want %q", got, wantSQL)
+	}
+	assertJSONLogs(t, logDirectory)
+	assertNoStagedBackup(t, stageDirectory)
+}
+
+func newTransientUploadProxy(t *testing.T, endpoint, bucket string) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	target, err := url.Parse(endpoint)
+	if err != nil {
+		t.Fatalf("parse LocalStack endpoint: %v", err)
+	}
+	reverseProxy := httputil.NewSingleHostReverseProxy(target)
+	uploadAttempts := &atomic.Int32{}
+	uploadPathPrefix := "/" + bucket + "/integration/production/"
+	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPut && strings.HasPrefix(request.URL.Path, uploadPathPrefix) {
+			attempt := uploadAttempts.Add(1)
+			if attempt == 1 {
+				_, _ = io.Copy(io.Discard, request.Body)
+				_ = request.Body.Close()
+				writer.Header().Set("Content-Type", "application/xml")
+				writer.Header().Set("Retry-After", "0")
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(writer, `<Error><Code>ServiceUnavailable</Code><Message>transient upload fault</Message></Error>`)
+				return
+			}
+		}
+		reverseProxy.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(proxy.Close)
+	return proxy, uploadAttempts
+}
+
 func repositoryRoot(t *testing.T) string {
 	t.Helper()
 	_, filename, _, ok := runtime.Caller(0)
@@ -183,6 +374,7 @@ type integrationConfig struct {
 	DumpBinary     string
 	Endpoint       string
 	LogDirectory   string
+	Password       string
 	RunAs          string
 	StageDirectory string
 }
@@ -210,6 +402,7 @@ jobs:
       host: 127.0.0.1
       port: 3306
       user: backup
+      password: %q
       databases: [application]
     s3:
       bucket: %q
@@ -219,7 +412,7 @@ jobs:
       force_path_style: true
       access_key_id: %q
       secret_access_key: %q
-`, values.DumpBinary, values.StageDirectory, values.LogDirectory, values.RunAs, values.Bucket, integrationRegion, values.Endpoint, testAccessKey, testSecretKey)
+`, values.DumpBinary, values.StageDirectory, values.LogDirectory, values.RunAs, values.Password, values.Bucket, integrationRegion, values.Endpoint, testAccessKey, testSecretKey)
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatalf("write integration config: %v", err)
 	}
@@ -233,6 +426,28 @@ func runCLI(t *testing.T, ctx context.Context, binary string, arguments ...strin
 	if err != nil {
 		t.Fatalf("run ezdbbackup %s: %v\n%s", strings.Join(arguments, " "), err, output)
 	}
+}
+
+func runCLIWithEnvironment(t *testing.T, ctx context.Context, binary string, environment map[string]string, arguments ...string) ([]byte, int) {
+	t.Helper()
+	names := make([]string, 0, len(environment))
+	for name := range environment {
+		names = append(names, name)
+	}
+	command := exec.CommandContext(ctx, binary, arguments...)
+	command.Env = environmentWithout(names...)
+	for name, value := range environment {
+		command.Env = append(command.Env, name+"="+value)
+	}
+	output, err := command.CombinedOutput()
+	if err == nil {
+		return output, 0
+	}
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) {
+		t.Fatalf("run ezdbbackup %s: %v\n%s", strings.Join(arguments, " "), err, output)
+	}
+	return output, exitError.ExitCode()
 }
 
 func gunzip(t *testing.T, compressed []byte) string {
@@ -321,6 +536,48 @@ func assertJSONLogs(t *testing.T, directory string) {
 	wantStages := []string{"start", "temporary_storage", "s3_upload", "complete"}
 	if !slices.Equal(stages, wantStages) {
 		t.Fatalf("log stages = %v, want %v", stages, wantStages)
+	}
+}
+
+func assertDumpFailureLog(t *testing.T, directory, password string) {
+	t.Helper()
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("read log directory: %v", err)
+	}
+	found := false
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		if bytes.Contains(contents, []byte(password)) {
+			t.Fatalf("%s exposed MySQL password", entry.Name())
+		}
+		scanner := bufio.NewScanner(bytes.NewReader(contents))
+		for scanner.Scan() {
+			var event map[string]any
+			if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+				t.Fatalf("parse %s JSON: %v", entry.Name(), err)
+			}
+			if event["level"] != "error" || event["stage"] != "dump_execution" {
+				continue
+			}
+			found = true
+			errorText, _ := event["error"].(string)
+			if !strings.Contains(errorText, "[REDACTED]") {
+				t.Fatalf("dump failure error = %q, want redaction marker", errorText)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			t.Fatalf("scan %s: %v", entry.Name(), err)
+		}
+	}
+	if !found {
+		t.Fatal("dump failure log event not found")
 	}
 }
 
