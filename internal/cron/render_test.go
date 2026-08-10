@@ -81,6 +81,8 @@ func TestRenderRejectsUnsafeInputs(t *testing.T) {
 		{name: "cron nickname", cfg: mutateRenderConfig(validConfig, func(cfg *config.Config) { setRenderJob(cfg, "production", "@daily", "root") }), binaryPath: "/bin/ezdbbackup", configPath: "/etc/ezdbbackup.yml"},
 		{name: "six field schedule", cfg: mutateRenderConfig(validConfig, func(cfg *config.Config) { setRenderJob(cfg, "production", "0 0 2 * * *", "root") }), binaryPath: "/bin/ezdbbackup", configPath: "/etc/ezdbbackup.yml"},
 		{name: "invalid schedule value", cfg: mutateRenderConfig(validConfig, func(cfg *config.Config) { setRenderJob(cfg, "production", "61 2 * * *", "root") }), binaryPath: "/bin/ezdbbackup", configPath: "/etc/ezdbbackup.yml"},
+		{name: "question mark", cfg: mutateRenderConfig(validConfig, func(cfg *config.Config) { setRenderJob(cfg, "production", "0 2 ? * *", "root") }), binaryPath: "/bin/ezdbbackup", configPath: "/etc/ezdbbackup.yml"},
+		{name: "day of week eight", cfg: mutateRenderConfig(validConfig, func(cfg *config.Config) { setRenderJob(cfg, "production", "0 2 * * 8", "root") }), binaryPath: "/bin/ezdbbackup", configPath: "/etc/ezdbbackup.yml"},
 		{name: "schedule newline", cfg: mutateRenderConfig(validConfig, func(cfg *config.Config) { setRenderJob(cfg, "production", "0 2 * *\n*", "root") }), binaryPath: "/bin/ezdbbackup", configPath: "/etc/ezdbbackup.yml"},
 		{name: "run user whitespace", cfg: mutateRenderConfig(validConfig, func(cfg *config.Config) { setRenderJob(cfg, "production", "0 2 * * *", "root admin") }), binaryPath: "/bin/ezdbbackup", configPath: "/etc/ezdbbackup.yml"},
 		{name: "run user newline", cfg: mutateRenderConfig(validConfig, func(cfg *config.Config) { setRenderJob(cfg, "production", "0 2 * * *", "root\nevil") }), binaryPath: "/bin/ezdbbackup", configPath: "/etc/ezdbbackup.yml"},
@@ -96,6 +98,32 @@ func TestRenderRejectsUnsafeInputs(t *testing.T) {
 			t.Parallel()
 			if _, err := Render(tt.cfg(), tt.binaryPath, tt.configPath); err == nil {
 				t.Fatal("Render() error = nil, want non-nil")
+			}
+		})
+	}
+}
+
+// This fails if rendering rejects valid /etc/cron.d Sunday/list/range/step
+// forms even though configuration validation accepts them.
+func TestRenderAcceptsCronDDialect(t *testing.T) {
+	t.Parallel()
+	for _, schedule := range []string{
+		"0 2 * * 7",
+		"*/15 0-23/2 1,15 * 1-5",
+		"*/15,7 0-23/2 1,15 * 1-5",
+		"0,15,30,45 0-23/2 1-31/3 JAN,MAR,DEC SUN,MON-FRI",
+	} {
+		t.Run(schedule, func(t *testing.T) {
+			t.Parallel()
+			cfg := &config.Config{Jobs: map[string]config.JobConfig{
+				"production": {Enabled: true, Schedule: schedule, RunAs: "root"},
+			}}
+			got, err := Render(cfg, "/bin/ezdbbackup", "/etc/ezdbbackup.yml")
+			if err != nil {
+				t.Fatalf("Render() error = %v, want /etc/cron.d schedule accepted", err)
+			}
+			if !strings.Contains(string(got), schedule+" root ") {
+				t.Fatalf("Render() = %q, want unchanged schedule", got)
 			}
 		})
 	}

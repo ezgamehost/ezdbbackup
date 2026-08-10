@@ -76,6 +76,7 @@ type S3Config struct {
 // Finding is one configuration error or warning. Path uses dot notation.
 type Finding struct {
 	Path    string
+	Job     string
 	Message string
 	Warning bool
 }
@@ -121,11 +122,19 @@ func (f Findings) Error() string {
 }
 
 func (f *Findings) addError(path, message string) {
-	*f = append(*f, Finding{Path: path, Message: message})
+	f.addJobError("", path, message)
 }
 
 func (f *Findings) addWarning(path, message string) {
-	*f = append(*f, Finding{Path: path, Message: message, Warning: true})
+	f.addJobWarning("", path, message)
+}
+
+func (f *Findings) addJobError(job, path, message string) {
+	*f = append(*f, Finding{Path: path, Job: job, Message: message})
+}
+
+func (f *Findings) addJobWarning(job, path, message string) {
+	*f = append(*f, Finding{Path: path, Job: job, Message: message, Warning: true})
 }
 
 // JobNames returns all configured job names in lexical order.

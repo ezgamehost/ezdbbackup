@@ -63,7 +63,7 @@ func (v Validator) Check(ctx context.Context, cfg *config.Config, jobNames []str
 	}
 
 	for _, finding := range config.Validate(cfg) {
-		job := configFindingJob(finding.Path, cfg)
+		job := finding.Job
 		if job != "" && !selected[job] {
 			continue
 		}
@@ -268,19 +268,6 @@ func selectedJobs(cfg *config.Config, requested []string) ([]string, map[string]
 	}
 	sort.Strings(names)
 	return names, selected, report
-}
-
-func configFindingJob(path string, cfg *config.Config) string {
-	if cfg == nil || !strings.HasPrefix(path, "jobs.") {
-		return ""
-	}
-	for _, name := range cfg.JobNames() {
-		prefix := "jobs." + name
-		if path == prefix || strings.HasPrefix(path, prefix+".") {
-			return name
-		}
-	}
-	return ""
 }
 
 func markConfigPrerequisite(state *jobPrerequisites, path, job string) {

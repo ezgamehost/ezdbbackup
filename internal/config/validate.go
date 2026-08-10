@@ -8,13 +8,12 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
-	"github.com/robfig/cron/v3"
+	"github.com/ezgamehost/ezdbbackup/internal/mysqldumpopt"
 )
 
 var jobNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
-
-var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 
 const (
 	maxRotationSizeMB  = math.MaxInt64 / (1024 * 1024)
@@ -32,9 +31,9 @@ func Validate(cfg *Config) Findings {
 	if cfg.Version != 1 {
 		findings.addError("version", "must be 1")
 	}
-	validateAbsolutePath(&findings, "defaults.dump_binary", cfg.Defaults.DumpBinary)
-	validateAbsolutePath(&findings, "defaults.temp_dir", cfg.Defaults.TempDir)
-	validateAbsolutePath(&findings, "logging.directory", cfg.Logging.Directory)
+	validateAbsolutePath(&findings, "", "defaults.dump_binary", cfg.Defaults.DumpBinary)
+	validateAbsolutePath(&findings, "", "defaults.temp_dir", cfg.Defaults.TempDir)
+	validateAbsolutePath(&findings, "", "logging.directory", cfg.Logging.Directory)
 	if cfg.Logging.Rotation.MaxSizeMB <= 0 {
 		findings.addError("logging.rotation.max_size_mb", "must be greater than zero")
 	} else if int64(cfg.Logging.Rotation.MaxSizeMB) > maxRotationSizeMB {
@@ -58,96 +57,98 @@ func Validate(cfg *Config) Findings {
 func validateJob(findings *Findings, name string, job JobConfig) {
 	base := "jobs." + name
 	if !jobNamePattern.MatchString(name) {
-		findings.addError(base, "job name must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+		findings.addJobError(name, base, "job name must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 	}
-	if strings.TrimSpace(job.Schedule) == "" || len(strings.Fields(job.Schedule)) != 5 {
-		findings.addError(base+".schedule", "must be a five-field cron expression")
-	} else if _, err := cronParser.Parse(job.Schedule); err != nil {
-		findings.addError(base+".schedule", fmt.Sprintf("invalid cron expression: %v", err))
+	if err := ValidateCronSchedule(job.Schedule); err != nil {
+		findings.addJobError(name, base+".schedule", fmt.Sprintf("invalid cron expression: %v", err))
 	}
 	if strings.TrimSpace(job.RunAs) == "" {
-		findings.addError(base+".run_as", "is required")
+		findings.addJobError(name, base+".run_as", "is required")
 	}
-	validateAbsolutePath(findings, base+".dump_binary", job.DumpBinary)
-	validateAbsolutePath(findings, base+".temp_dir", job.TempDir)
+	validateAbsolutePath(findings, name, base+".dump_binary", job.DumpBinary)
+	validateAbsolutePath(findings, name, base+".temp_dir", job.TempDir)
 
 	if strings.TrimSpace(job.MySQL.Host) == "" {
-		findings.addError(base+".mysql.host", "is required")
+		findings.addJobError(name, base+".mysql.host", "is required")
 	}
 	if job.MySQL.Port < 1 || job.MySQL.Port > 65535 {
-		findings.addError(base+".mysql.port", "must be between 1 and 65535")
+		findings.addJobError(name, base+".mysql.port", "must be between 1 and 65535")
 	}
 	if strings.TrimSpace(job.MySQL.User) == "" {
-		findings.addError(base+".mysql.user", "is required")
+		findings.addJobError(name, base+".mysql.user", "is required")
 	}
 	databases := job.MySQL.Databases
 	if databases.All && len(databases.Names) > 0 {
-		findings.addError(base+".mysql.databases", "must select either all databases or an explicit list")
+		findings.addJobError(name, base+".mysql.databases", "must select either all databases or an explicit list")
 	} else if !databases.All && len(databases.Names) == 0 {
-		findings.addError(base+".mysql.databases", "is required")
+		findings.addJobError(name, base+".mysql.databases", "is required")
 	} else if !databases.All {
-		for i, name := range databases.Names {
-			if name == "" {
-				findings.addError(fmt.Sprintf("%s.mysql.databases[%d]", base, i), "must not be empty")
+		for i, databaseName := range databases.Names {
+			if databaseName == "" {
+				findings.addJobError(name, fmt.Sprintf("%s.mysql.databases[%d]", base, i), "must not be empty")
+			} else if strings.HasPrefix(databaseName, "-") {
+				findings.addJobError(name, fmt.Sprintf("%s.mysql.databases[%d]", base, i), "must not begin with '-'")
+			} else if strings.IndexFunc(databaseName, unicode.IsControl) >= 0 {
+				findings.addJobError(name, fmt.Sprintf("%s.mysql.databases[%d]", base, i), "must not contain control characters")
 			}
 		}
 	}
-	validateSecretRef(findings, base+".mysql.password", job.MySQL.PasswordRef())
+	validateSecretRef(findings, name, base+".mysql.password", job.MySQL.PasswordRef())
 	for i, arg := range job.MySQL.ExtraArgs {
 		if conflictingDumpArgument(arg) {
-			findings.addError(fmt.Sprintf("%s.mysql.extra_args[%d]", base, i), "conflicts with an ezdbbackup-managed mysqldump setting")
+			findings.addJobError(name, fmt.Sprintf("%s.mysql.extra_args[%d]", base, i), "conflicts with an ezdbbackup-managed mysqldump setting")
 		}
 	}
 
 	if strings.TrimSpace(job.S3.Bucket) == "" {
-		findings.addError(base+".s3.bucket", "is required")
+		findings.addJobError(name, base+".s3.bucket", "is required")
 	}
 	if strings.TrimSpace(job.S3.Region) == "" {
-		findings.addError(base+".s3.region", "is required")
+		findings.addJobError(name, base+".s3.region", "is required")
 	}
-	validateEndpoint(findings, base+".s3.endpoint", job.S3.Endpoint)
+	validateEndpoint(findings, name, base+".s3.endpoint", job.S3.Endpoint)
 	accessKeyID := job.S3.AccessKeyIDRef()
 	secretAccessKey := job.S3.SecretAccessKeyRef()
 	sessionToken := job.S3.SessionTokenRef()
-	validateSecretRef(findings, base+".s3.access_key_id", accessKeyID)
-	validateSecretRef(findings, base+".s3.secret_access_key", secretAccessKey)
-	validateSecretRef(findings, base+".s3.session_token", sessionToken)
+	validateSecretRef(findings, name, base+".s3.access_key_id", accessKeyID)
+	validateSecretRef(findings, name, base+".s3.secret_access_key", secretAccessKey)
+	validateSecretRef(findings, name, base+".s3.session_token", sessionToken)
 	accessConfigured := secretConfigured(accessKeyID)
 	secretKeyConfigured := secretConfigured(secretAccessKey)
 	if accessConfigured != secretKeyConfigured {
-		findings.addError(base+".s3", "explicit access key ID and secret access key must be configured together")
+		findings.addJobError(name, base+".s3", "explicit access key ID and secret access key must be configured together")
 	}
 	if secretConfigured(sessionToken) && (!accessConfigured || !secretKeyConfigured) {
-		findings.addError(base+".s3.session_token", "requires explicit access key ID and secret access key")
+		findings.addJobError(name, base+".s3.session_token", "requires explicit access key ID and secret access key")
 	}
 }
 
-func validateAbsolutePath(findings *Findings, path, value string) {
+func validateAbsolutePath(findings *Findings, job, path, value string) {
 	if value == "" || !filepath.IsAbs(value) {
-		findings.addError(path, "must be an absolute path")
+		findings.addJobError(job, path, "must be an absolute path")
 	}
 }
 
-func validateSecretRef(findings *Findings, path string, secret SecretRef) {
+func validateSecretRef(findings *Findings, job, path string, secret SecretRef) {
 	if secret.Literal != "" && secret.File != "" {
-		findings.addError(path, "literal and file secret sources are mutually exclusive")
+		findings.addJobError(job, path, "literal and file secret sources are mutually exclusive")
 	}
 	if secret.File != "" && !filepath.IsAbs(secret.File) {
-		findings.addError(path+"_file", "must be an absolute path")
+		findings.addJobError(job, path+"_file", "must be an absolute path")
 	}
 }
 
-func validateEndpoint(findings *Findings, path, endpoint string) {
+func validateEndpoint(findings *Findings, job, path, endpoint string) {
 	if endpoint == "" {
 		return
 	}
 	u, err := url.ParseRequestURI(endpoint)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		findings.addError(path, "must be a complete http:// or https:// URL")
+		findings.addJobError(job, path, "must be a complete http:// or https:// URL")
 		return
 	}
 	if u.Scheme == "http" {
-		findings.addWarning(path, "plain HTTP endpoint configured")
+		findings.addJobWarning(job, path, "plain HTTP endpoint configured")
 	}
 }
 
@@ -156,30 +157,102 @@ func secretConfigured(secret SecretRef) bool {
 }
 
 func conflictingDumpArgument(arg string) bool {
-	if !strings.HasPrefix(arg, "-") {
+	if strings.IndexFunc(arg, unicode.IsControl) >= 0 {
 		return true
 	}
-	for _, option := range []string{
-		"--output", "--result-file", "--tab", "--host", "--port", "--user", "--password", "--all-databases", "--databases",
-	} {
-		if arg == option || strings.HasPrefix(arg, option+"=") {
-			return true
+	name, ok := mysqldumpopt.LongName(arg)
+	if !ok {
+		return true
+	}
+	base := name
+	for {
+		stripped := false
+		for _, prefix := range []string{"enable-", "disable-", "skip-", "maximum-", "loose-"} {
+			if strings.HasPrefix(base, prefix) {
+				if prefix == "loose-" {
+					return true
+				}
+				base = strings.TrimPrefix(base, prefix)
+				stripped = true
+				break
+			}
+		}
+		if !stripped {
+			break
 		}
 	}
-	if containsManagedShortOption(arg) {
+	if _, allowed := safeExactDumpOptions[name]; allowed {
+		return false
+	}
+	if _, forbidden := forbiddenDumpOptions[base]; forbidden {
 		return true
+	}
+	if strings.HasPrefix(base, "password") || forbiddenDumpOptionOrAbbreviation(base) {
+		return true
+	}
+	return strings.HasPrefix(base, "init-command-")
+}
+
+var safeExactDumpOptions = map[string]struct{}{
+	// MariaDB's --all is a deprecated alias for --create-options, not a
+	// database-scope selector. Do not confuse it with --all-databases.
+	"all": {},
+}
+
+func forbiddenDumpOptionOrAbbreviation(name string) bool {
+	for forbidden := range forbiddenDumpOptions {
+		if name == forbidden || strings.HasPrefix(forbidden, name) {
+			return true
+		}
 	}
 	return false
 }
 
-func containsManagedShortOption(arg string) bool {
-	if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") {
-		return false
-	}
-	for _, option := range "rhPupAB" {
-		if strings.ContainsRune(arg[1:], option) {
-			return true
-		}
-	}
-	return false
+var forbiddenDumpOptions = map[string]struct{}{
+	"all-databases":                 {},
+	"databases":                     {},
+	"debug":                         {},
+	"debug-check":                   {},
+	"debug-info":                    {},
+	"defaults-extra-file":           {},
+	"defaults-file":                 {},
+	"defaults-group-suffix":         {},
+	"delete-master-logs":            {},
+	"delete-source-logs":            {},
+	"dir":                           {},
+	"dump-replica":                  {},
+	"dump-slave":                    {},
+	"fields-enclosed-by":            {},
+	"fields-escaped-by":             {},
+	"fields-optionally-enclosed-by": {},
+	"fields-terminated-by":          {},
+	"flush-logs":                    {},
+	"flush-privileges":              {},
+	"help":                          {},
+	"host":                          {},
+	"ignore-database":               {},
+	"ignore-table":                  {},
+	"ignore-table-data":             {},
+	"init-command":                  {},
+	"lines-terminated-by":           {},
+	"log-error":                     {},
+	"login-path":                    {},
+	"no-defaults":                   {},
+	"no-login-paths":                {},
+	"output":                        {},
+	"password":                      {},
+	"password1":                     {},
+	"password2":                     {},
+	"password3":                     {},
+	"port":                          {},
+	"print-defaults":                {},
+	"result-file":                   {},
+	"system":                        {},
+	"tab":                           {},
+	"tables":                        {},
+	"tee":                           {},
+	"user":                          {},
+	"users":                         {},
+	"version":                       {},
+	"wildcards":                     {},
 }

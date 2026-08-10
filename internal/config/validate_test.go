@@ -111,6 +111,115 @@ func TestValidateRejectsClustersWithManagedShortOptions(t *testing.T) {
 	}
 }
 
+// This fails if spelling variants, parser controls, credential options,
+// side-output options, or live-server mutations cross the extra_args boundary.
+func TestValidateRejectsUnsafeExtraArguments(t *testing.T) {
+	tests := []struct {
+		name string
+		arg  string
+	}{
+		{name: "parser terminator", arg: "--"},
+		{name: "positional", arg: "otherdb"},
+		{name: "empty positional", arg: ""},
+		{name: "short quick", arg: "-q"},
+		{name: "short verbose", arg: "-v"},
+		{name: "case insensitive host", arg: "--HOST=other"},
+		{name: "owned port", arg: "--port=3307"},
+		{name: "owned user", arg: "--user=other"},
+		{name: "password", arg: "--password=secret"},
+		{name: "first factor password", arg: "--password1=secret"},
+		{name: "second factor password", arg: "--password2=secret"},
+		{name: "third factor password", arg: "--password3=secret"},
+		{name: "future factor password", arg: "--password9=secret"},
+		{name: "skip password", arg: "--skip-password"},
+		{name: "canonicalized skip factor password", arg: "--SKIP_PASSWORD2"},
+		{name: "result file", arg: "--result-file=/tmp/plain.sql"},
+		{name: "canonicalized result file", arg: "--RESULT_FILE=/tmp/plain.sql"},
+		{name: "tab directory", arg: "--tab=/tmp/plain"},
+		{name: "parallel output directory", arg: "--dir=/tmp/plain"},
+		{name: "canonicalized parallel output directory", arg: "--DIR=/tmp/plain"},
+		{name: "output alias", arg: "--output=/tmp/plain.sql"},
+		{name: "error side output", arg: "--log-error=/tmp/dump.log"},
+		{name: "debug side output", arg: "--debug=d:t:o,/tmp/mysql.trace"},
+		{name: "all databases", arg: "--all-databases"},
+		{name: "canonicalized all databases", arg: "--ALL_DATABASES"},
+		{name: "databases", arg: "--databases"},
+		{name: "tables override", arg: "--tables"},
+		{name: "database wildcards", arg: "--wildcards"},
+		{name: "help", arg: "--help"},
+		{name: "version", arg: "--version"},
+		{name: "print defaults", arg: "--print-defaults"},
+		{name: "defaults file", arg: "--defaults-file=/tmp/my.cnf"},
+		{name: "defaults extra file", arg: "--defaults-extra-file=/tmp/my.cnf"},
+		{name: "defaults group suffix", arg: "--defaults-group-suffix=other"},
+		{name: "no defaults", arg: "--no-defaults"},
+		{name: "login path", arg: "--login-path=other"},
+		{name: "no login paths", arg: "--no-login-paths"},
+		{name: "delete source logs", arg: "--delete-source-logs"},
+		{name: "canonicalized delete source logs", arg: "--DELETE_SOURCE_LOGS"},
+		{name: "delete master logs", arg: "--delete-master-logs"},
+		{name: "flush logs", arg: "--flush-logs"},
+		{name: "flush server privileges", arg: "--flush-privileges"},
+		{name: "stop replica", arg: "--dump-replica=2"},
+		{name: "stop replica legacy alias", arg: "--DUMP_SLAVE"},
+		{name: "arbitrary SQL on connect", arg: "--init-command=DELETE FROM audit"},
+		{name: "additional arbitrary SQL on connect", arg: "--init-command-add=DELETE FROM audit"},
+		{name: "loose modifier bypass", arg: "--loose-delete-source-logs"},
+		{name: "nested loose credential bypass", arg: "--enable-loose-password=secret"},
+		{name: "nested maximum loose side output bypass", arg: "--maximum-loose-result-file=/tmp/plain.sql"},
+		{name: "nested skip loose server mutation bypass", arg: "--skip-loose-delete-source-logs"},
+		{name: "abbreviated result file", arg: "--res=/tmp/plain.sql"},
+		{name: "abbreviated log deletion", arg: "--delete-s"},
+		{name: "malformed triple dash", arg: "---result-file=/tmp/plain.sql"},
+		{name: "control character", arg: "--where=id\nOR 1=1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			job := cfg.Jobs["production"]
+			job.MySQL.ExtraArgs = []string{tt.arg}
+			cfg.Jobs["production"] = job
+			if findings := Validate(cfg); !findings.HasErrors() {
+				t.Fatalf("Validate() findings = %v, want error for %q", findings, tt.arg)
+			}
+		})
+	}
+}
+
+// This fails if normal dump-shaping and TLS options are accidentally rejected
+// while hardening the managed-option boundary.
+func TestValidateAllowsOrdinaryLongExtraArguments(t *testing.T) {
+	cfg := validConfig()
+	job := cfg.Jobs["production"]
+	job.MySQL.ExtraArgs = []string{
+		"--all",
+		"--single-transaction",
+		"--quick",
+		"--ssl-mode=VERIFY_IDENTITY",
+		"--where=id > 100",
+	}
+	cfg.Jobs["production"] = job
+	if findings := Validate(cfg); findings.HasErrors() {
+		t.Fatalf("Validate() findings = %v, want safe long options accepted", findings)
+	}
+}
+
+// This fails if database operands can be parsed as options or carry terminal
+// control characters into the child-process boundary.
+func TestValidateRejectsUnsafeDatabaseNames(t *testing.T) {
+	for _, name := range []string{"-application", "application\narchive", "application\tarchive", "application\x00archive"} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig()
+			job := cfg.Jobs["production"]
+			job.MySQL.Databases = DatabaseSelection{Names: []string{name}}
+			cfg.Jobs["production"] = job
+			if findings := Validate(cfg); !findings.HasErrors() {
+				t.Fatalf("Validate() findings = %v, want unsafe database-name error", findings)
+			}
+		})
+	}
+}
+
 func TestValidateWarnsForPlainHTTPEndpoint(t *testing.T) {
 	cfg := validConfig()
 	job := cfg.Jobs["production"]
@@ -122,6 +231,31 @@ func TestValidateWarnsForPlainHTTPEndpoint(t *testing.T) {
 	}
 	if findings.HasErrors() {
 		t.Fatalf("unexpected errors: %v", findings)
+	}
+}
+
+// This fails if downstream validation must infer a job from a dotted path,
+// which is ambiguous when malformed names such as "a.bad" are present.
+func TestValidateFindingsCarryExactJobIdentity(t *testing.T) {
+	cfg := validConfig()
+	job := cfg.Jobs["production"]
+	delete(cfg.Jobs, "production")
+	job.MySQL.Host = ""
+	cfg.Jobs["a.bad"] = job
+
+	findings := Validate(cfg)
+	foundHost := false
+	for _, finding := range findings {
+		if finding.Path != "jobs.a.bad.mysql.host" {
+			continue
+		}
+		foundHost = true
+		if finding.Job != "a.bad" {
+			t.Fatalf("host finding job = %q, want exact dotted job identity", finding.Job)
+		}
+	}
+	if !foundHost {
+		t.Fatalf("Validate() findings = %v, want host finding", findings)
 	}
 }
 
@@ -158,6 +292,60 @@ func TestValidateRotationConversionBounds(t *testing.T) {
 			}
 			if !found {
 				t.Fatalf("Validate() findings = %v, want %s overflow", findings, tt.wantPath)
+			}
+		})
+	}
+}
+
+// This fails if schedule validation follows a library dialect instead of the
+// numeric/name list-range-step grammar accepted by /etc/cron.d.
+func TestValidateCronDDialect(t *testing.T) {
+	valid := []string{
+		"0 2 * * 0",
+		"0 2 * * 7",
+		"*/15 0-23/2 1,15 * 1-5",
+		"*/15,7 0-23/2 1,15 * 1-5",
+		"0,15,30,45 0-23/2 1-31/3 JAN,MAR,DEC SUN,MON-FRI",
+		"5 4 * jan sun",
+	}
+	for _, schedule := range valid {
+		t.Run("valid_"+schedule, func(t *testing.T) {
+			cfg := validConfig()
+			job := cfg.Jobs["production"]
+			job.Schedule = schedule
+			cfg.Jobs["production"] = job
+			if findings := Validate(cfg); findings.HasErrors() {
+				t.Fatalf("Validate() findings = %v, want /etc/cron.d schedule accepted", findings)
+			}
+		})
+	}
+
+	invalid := []string{
+		"0 2 ? * *",
+		"60 2 * * *",
+		"0 24 * * *",
+		"0 2 0 * *",
+		"0 2 32 * *",
+		"0 2 * 0 *",
+		"0 2 * 13 *",
+		"0 2 * * 8",
+		"*/0 2 * * *",
+		"5-1 2 * * *",
+		"1,,2 2 * * *",
+		"1- 2 * * *",
+		"1/2 2 * * *",
+		"0 2 * FOO *",
+		"0 2 * * MON#2",
+		"0 2 * * MON\n",
+	}
+	for _, schedule := range invalid {
+		t.Run("invalid_"+schedule, func(t *testing.T) {
+			cfg := validConfig()
+			job := cfg.Jobs["production"]
+			job.Schedule = schedule
+			cfg.Jobs["production"] = job
+			if findings := Validate(cfg); !findings.HasErrors() {
+				t.Fatalf("Validate() findings = %v, want /etc/cron.d schedule rejected", findings)
 			}
 		})
 	}

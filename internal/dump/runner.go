@@ -1,7 +1,6 @@
 package dump
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,9 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 )
 
 const defaultStderrLimit int64 = 64 << 10
+const defaultWaitDelay = 250 * time.Millisecond
 
 // Runner executes validated mysqldump requests.
 type Runner interface {
@@ -57,23 +60,69 @@ func (r ExecRunner) Probe(ctx context.Context, req Request) error {
 
 func (r ExecRunner) run(ctx context.Context, req Request, args []string, dst io.Writer) error {
 	stderr := newRedactingCappedBuffer(r.stderrLimit(), req.Password)
+	stdout := &errorRecordingWriter{dst: dst}
 	cmd := exec.CommandContext(ctx, req.Binary, args...)
-	cmd.Stdout = dst
+	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Env = childEnv(req.Password)
-	err := cmd.Run()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return killProcessGroup(cmd.Process) }
+	cmd.WaitDelay = defaultWaitDelay
+	if err := cmd.Start(); err != nil {
+		stderr.finish()
+		return &RunError{Kind: FailureStartup, Err: fmt.Errorf("%w: %s", err, stderr.String())}
+	}
+	err := cmd.Wait()
+	if copyErr := stdout.Err(); copyErr != nil && !errors.Is(err, copyErr) {
+		err = errors.Join(err, copyErr)
+	}
+	if err != nil {
+		_ = killProcessGroup(cmd.Process)
+	}
 	stderr.finish()
 	if err != nil {
-		kind := FailureExecution
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) {
-			kind = FailureStartup
-		}
 		cause := err
 		if ctx.Err() != nil {
 			cause = errors.Join(ctx.Err(), err)
 		}
-		return &RunError{Kind: kind, Err: fmt.Errorf("%w: %s", cause, stderr.String())}
+		return &RunError{Kind: FailureExecution, Err: fmt.Errorf("%w: %s", cause, stderr.String())}
+	}
+	return nil
+}
+
+type errorRecordingWriter struct {
+	dst io.Writer
+	mu  sync.Mutex
+	err error
+}
+
+func (w *errorRecordingWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	if err != nil {
+		w.mu.Lock()
+		if w.err == nil {
+			w.err = err
+		}
+		w.mu.Unlock()
+	}
+	return n, err
+}
+
+func (w *errorRecordingWriter) Err() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.err
+}
+
+func killProcessGroup(process *os.Process) error {
+	if process == nil {
+		return os.ErrProcessDone
+	}
+	if err := syscall.Kill(-process.Pid, syscall.SIGKILL); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
 	}
 	return nil
 }
@@ -88,14 +137,47 @@ func (r ExecRunner) stderrLimit() int64 {
 func childEnv(password string) []string {
 	env := make([]string, 0, len(os.Environ())+1)
 	for _, entry := range os.Environ() {
-		if !strings.HasPrefix(entry, "MYSQL_PWD=") {
-			env = append(env, entry)
+		name, _, _ := strings.Cut(entry, "=")
+		if name == "MYSQL_PWD" {
+			continue
 		}
+		if _, sensitive := cloudCredentialEnvironment[name]; sensitive {
+			continue
+		}
+		env = append(env, entry)
 	}
 	if password != "" {
 		env = append(env, "MYSQL_PWD="+password)
 	}
 	return env
+}
+
+var cloudCredentialEnvironment = map[string]struct{}{
+	"AMAZON_ACCESS_KEY_ID":                   {},
+	"AMAZON_ACCESS_KEY":                      {},
+	"AMAZON_SECURITY_TOKEN":                  {},
+	"AMAZON_SECRET_ACCESS_KEY":               {},
+	"AMAZON_SECRET_KEY":                      {},
+	"AWS_ACCESS_KEY":                         {},
+	"AWS_ACCESS_KEY_ID":                      {},
+	"AWS_CONFIG_FILE":                        {},
+	"AWS_CONTAINER_AUTHORIZATION_TOKEN":      {},
+	"AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": {},
+	"AWS_CONTAINER_CREDENTIALS_FULL_URI":     {},
+	"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": {},
+	"AWS_CREDENTIAL_FILE":                    {},
+	"AWS_CREDENTIAL_PROFILES_FILE":           {},
+	"AWS_CREDENTIALS_FILE":                   {},
+	"AWS_DEFAULT_PROFILE":                    {},
+	"AWS_PROFILE":                            {},
+	"AWS_ROLE_ARN":                           {},
+	"AWS_ROLE_SESSION_NAME":                  {},
+	"AWS_SECRET_ACCESS_KEY":                  {},
+	"AWS_SECRET_KEY":                         {},
+	"AWS_SECURITY_TOKEN":                     {},
+	"AWS_SESSION_TOKEN":                      {},
+	"AWS_SHARED_CREDENTIALS_FILE":            {},
+	"AWS_WEB_IDENTITY_TOKEN_FILE":            {},
 }
 
 type cappedBuffer struct {
@@ -122,11 +204,17 @@ func (b *cappedBuffer) String() string {
 type redactingCappedBuffer struct {
 	output  cappedBuffer
 	secret  []byte
-	pending []byte
+	failure []int
+	matched int
 }
 
 func newRedactingCappedBuffer(limit int64, secret string) *redactingCappedBuffer {
-	return &redactingCappedBuffer{output: cappedBuffer{limit: limit}, secret: []byte(secret)}
+	secretBytes := []byte(secret)
+	return &redactingCappedBuffer{
+		output:  cappedBuffer{limit: limit},
+		secret:  secretBytes,
+		failure: prefixFailureTable(secretBytes),
+	}
 }
 
 func (b *redactingCappedBuffer) Write(p []byte) (int, error) {
@@ -136,47 +224,55 @@ func (b *redactingCappedBuffer) Write(p []byte) (int, error) {
 		return written, nil
 	}
 	for _, value := range p {
-		b.pending = append(b.pending, value)
-		b.flushCompleteSecrets()
+		if int64(len(b.output.data)) >= b.output.limit {
+			b.matched = 0
+			break
+		}
+		previous := b.matched
+		for b.matched > 0 && b.secret[b.matched] != value {
+			b.matched = b.failure[b.matched-1]
+		}
+		if b.secret[b.matched] == value {
+			if b.matched < previous {
+				_, _ = b.output.Write(b.secret[:previous-b.matched])
+			}
+			b.matched++
+			if b.matched == len(b.secret) {
+				_, _ = b.output.Write([]byte("[REDACTED]"))
+				b.matched = 0
+			}
+			continue
+		}
+		if previous > 0 {
+			_, _ = b.output.Write(b.secret[:previous])
+		}
+		_, _ = b.output.Write([]byte{value})
 	}
 	return written, nil
 }
 
-func (b *redactingCappedBuffer) flushCompleteSecrets() {
-	for len(b.pending) >= len(b.secret) {
-		if bytes.HasPrefix(b.pending, b.secret) {
-			_, _ = b.output.Write([]byte("[REDACTED]"))
-			b.pending = b.pending[len(b.secret):]
-			continue
+func prefixFailureTable(pattern []byte) []int {
+	failure := make([]int, len(pattern))
+	for i, matched := 1, 0; i < len(pattern); i++ {
+		for matched > 0 && pattern[matched] != pattern[i] {
+			matched = failure[matched-1]
 		}
-		_, _ = b.output.Write(b.pending[:1])
-		b.pending = b.pending[1:]
+		if pattern[matched] == pattern[i] {
+			matched++
+		}
+		failure[i] = matched
 	}
+	return failure
 }
 
 func (b *redactingCappedBuffer) finish() {
-	if len(b.pending) == 0 {
+	if b.matched == 0 {
 		return
 	}
-	prefixLength := trailingSecretPrefixLength(b.pending, b.secret)
-	if prefixLength > 0 {
-		_, _ = b.output.Write(b.pending[:len(b.pending)-prefixLength])
-		_, _ = b.output.Write([]byte("[REDACTED]"))
-	} else {
-		_, _ = b.output.Write(b.pending)
-	}
-	b.pending = nil
+	_, _ = b.output.Write([]byte("[REDACTED]"))
+	b.matched = 0
 }
 
 func (b *redactingCappedBuffer) String() string {
 	return b.output.String()
-}
-
-func trailingSecretPrefixLength(value, secret []byte) int {
-	for length := min(len(value), len(secret)-1); length > 0; length-- {
-		if bytes.Equal(value[len(value)-length:], secret[:length]) {
-			return length
-		}
-	}
-	return 0
 }

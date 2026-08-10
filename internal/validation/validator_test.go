@@ -66,6 +66,55 @@ func TestValidatorSelectedJobsLimitConfigurationAndEnvironmentChecks(t *testing.
 	}
 }
 
+// This fails if selected-job configuration findings are assigned by dotted
+// path prefix and "jobs.a.bad" is mistaken for job "a".
+func TestValidatorSelectedDottedJobKeepsItsConfigurationFindings(t *testing.T) {
+	cfg := validValidationConfig()
+	cfg.Jobs["a"] = validValidationJob("a", true)
+	dotted := validValidationJob("a.bad", true)
+	dotted.MySQL.Host = ""
+	cfg.Jobs["a.bad"] = dotted
+
+	report := newValidator(&fakeEnvironment{}, &fakeRemoteDependencies{}).Check(
+		context.Background(), cfg, []string{"a.bad"}, Options{
+			BinaryPath: "/bin/ezdbbackup",
+			ConfigPath: "/etc/ezdbbackup/config.yml",
+		},
+	)
+	if !hasFinding(report, "a.bad", "configuration", "jobs.a.bad.mysql.host") {
+		t.Fatalf("Check(selected) findings = %#v, want exact dotted-job host finding", report.Findings)
+	}
+	for _, finding := range report.Findings {
+		if finding.Job == "a" {
+			t.Fatalf("Check(selected) leaked unselected job finding: %#v", finding)
+		}
+	}
+}
+
+// This fails if all-job validation collapses findings for a dotted job into a
+// shorter job whose name is also a path prefix.
+func TestValidatorAllKeepsDistinctDottedJobFindings(t *testing.T) {
+	cfg := validValidationConfig()
+	short := validValidationJob("a", true)
+	short.MySQL.Host = ""
+	cfg.Jobs["a"] = short
+	dotted := validValidationJob("a.bad", true)
+	dotted.MySQL.Host = ""
+	cfg.Jobs["a.bad"] = dotted
+
+	report := newValidator(&fakeEnvironment{}, &fakeRemoteDependencies{}).Check(
+		context.Background(), cfg, nil, Options{
+			BinaryPath: "/bin/ezdbbackup",
+			ConfigPath: "/etc/ezdbbackup/config.yml",
+		},
+	)
+	for _, job := range []string{"a", "a.bad"} {
+		if !hasFinding(report, job, "configuration", "jobs."+job+".mysql.host") {
+			t.Fatalf("Check(all) findings = %#v, want distinct finding for %q", report.Findings, job)
+		}
+	}
+}
+
 func TestValidatorReportsUnknownSelectedJob(t *testing.T) {
 	report := newValidator(&fakeEnvironment{}, &fakeRemoteDependencies{}).Check(
 		context.Background(), validValidationConfig(), []string{"missing"}, Options{

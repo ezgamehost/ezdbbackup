@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"strings"
 
 	"github.com/ezgamehost/ezdbbackup/internal/backup"
 	"github.com/ezgamehost/ezdbbackup/internal/config"
@@ -106,7 +105,7 @@ func globalConfigFindings(cfg *config.Config) config.Findings {
 	all := config.Validate(cfg)
 	global := make(config.Findings, 0, len(all))
 	for _, finding := range all {
-		if strings.HasPrefix(finding.Path, "jobs.") {
+		if finding.Job != "" {
 			continue
 		}
 		global = append(global, finding)

@@ -26,6 +26,9 @@ func Decode(r io.Reader) (*Config, Findings) {
 	if err != nil {
 		return nil, Findings{{Message: fmt.Sprintf("read configuration: %v", err)}}
 	}
+	if err := validateStrictYAML(b); err != nil {
+		return nil, Findings{{Message: fmt.Sprintf("decode configuration: %v", err)}}
+	}
 
 	decoder := yaml.NewDecoder(bytes.NewReader(b))
 	decoder.KnownFields(true)

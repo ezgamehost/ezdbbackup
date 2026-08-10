@@ -9,16 +9,11 @@ import (
 	"unicode"
 
 	"github.com/ezgamehost/ezdbbackup/internal/config"
-	robfigcron "github.com/robfig/cron/v3"
 )
 
 const (
 	OwnershipMarker = "# ezdbbackup-managed: v1"
 	systemPath      = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-)
-
-var fiveFieldParser = robfigcron.NewParser(
-	robfigcron.Minute | robfigcron.Hour | robfigcron.Dom | robfigcron.Month | robfigcron.Dow,
 )
 
 // Render returns a deterministic /etc/cron.d file for the enabled jobs in cfg.
@@ -47,13 +42,10 @@ func Render(cfg *config.Config, binaryPath, configPath string) ([]byte, error) {
 		if err := rejectLineBreakOrNUL("schedule for job "+name, job.Schedule); err != nil {
 			return nil, err
 		}
-		fields := strings.Fields(job.Schedule)
-		if len(fields) != 5 {
-			return nil, fmt.Errorf("render cron: schedule for job %q must be a five-field cron expression", name)
-		}
-		if _, err := fiveFieldParser.Parse(job.Schedule); err != nil {
+		if err := config.ValidateCronSchedule(job.Schedule); err != nil {
 			return nil, fmt.Errorf("render cron: invalid schedule for job %q: %w", name, err)
 		}
+		fields := strings.Fields(job.Schedule)
 		if err := validateRunAs(name, job.RunAs); err != nil {
 			return nil, err
 		}

@@ -31,6 +31,10 @@ jobs:
       databases:
         - application
         - analytics
+      # extra_args accepts only complete long options (--name or
+      # --name=value). Connection ownership, credentials, DB/table scope,
+      # side-output, defaults/login, early-exit, and server-mutating options
+      # are rejected.
       extra_args:
         - --single-transaction
         - --quick

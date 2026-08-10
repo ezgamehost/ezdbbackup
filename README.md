@@ -74,11 +74,15 @@ override `dump_binary` and `temp_dir`.
 ### Strict schema and job rules
 
 The configuration loader accepts exactly one YAML document. It rejects unknown
-fields, duplicate mapping keys, malformed types, and any `version` other than
-`1`. Job names must match `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`. Schedules must be
-standard five-field cron expressions; nicknames such as `@daily` are rejected.
-Every job requires an existing `run_as` user, MySQL host/user/database scope,
-and S3 bucket/region.
+fields, duplicate mapping keys, nulls, wrong scalar tags (including quoted
+numbers for integer fields), YAML anchors, aliases and merge keys, malformed
+collection types, and any `version` other than `1`. Job names must match
+`[A-Za-z0-9][A-Za-z0-9_-]{0,63}`.
+Schedules use the five `/etc/cron.d` time fields and support numeric/name
+lists, ranges, and steps; day-of-week `0` and `7` both mean Sunday. Nicknames
+such as `@daily`, Quartz `?`, and out-of-range values are rejected. Every job
+requires an existing `run_as` user, MySQL host/user/database scope, and S3
+bucket/region.
 
 `databases` is required and has only two forms:
 
@@ -92,8 +96,27 @@ databases:
   - analytics
 ```
 
-`extra_args` retain their listed order, but cannot replace settings owned by
-ezdbbackup: output destinations, host, port, user, password, or database scope.
+Database names must not begin with `-` or contain control characters. A `--`
+option terminator is inserted before selected database operands.
+
+`extra_args` retain their listed order and must use one complete long option
+per YAML item (`--name` or `--name=value`). Positional arguments, `--`, and all
+short options are rejected. Names are checked case-insensitively with `_`
+treated as `-`. Options are rejected when they can override host/port/user,
+credentials (including multifactor password options), database/table scope or
+wildcards, output/result/tab/directory/debug files, defaults or login paths;
+exit early via help/version/print-defaults; or mutate the server through log
+deletion, flushing, replica control, or an init command. Unsafe abbreviated
+spellings are rejected too. This prevents a backup configuration from uploading
+help text or writing an unprotected side copy. Normal dump-shaping long options
+such as `--single-transaction` and `--quick` remain supported.
+
+Connectivity probes do not reuse dump-shaping `extra_args`. They copy only an
+audited set of transport, authentication-plugin, and TLS options, force
+no-data/no-DDL output, disable ordinary MySQL option files, table locks, and log
+flushing/deletion before selecting the configured databases. Disabling option
+files prevents inherited result-file, init-command, or replica controls from
+making a probe write files or change server state.
 
 Configured `dump_binary`, staging, log, and secret paths must be clean absolute
 paths. Local validation rejects a symbolic link in any component of those
@@ -105,7 +128,10 @@ hard-linked file at `/etc/cron.d/ezdbbackup`.
 
 MySQL accepts either `password` or `password_file`, never both. Omitting both
 uses whatever authentication the `mysqldump` process already has, such as an
-operator-managed login path or option file.
+operator-managed login path or option file, for actual backups. Connectivity
+probes start `mysqldump` with `--no-defaults` for safety, so authentication kept
+only in a regular option file is not available to the probe. Configure a job
+password source (or a supported MySQL login path) when using `--connectivity`.
 
 S3 has literal and `_file` forms for `access_key_id`, `secret_access_key`, and
 the optional `session_token`. Literal and file forms of the same value are
@@ -127,8 +153,11 @@ process environments are not logged.
 
 ezdbbackup never adds a MySQL password to the argument vector and never creates
 a MySQL option file. If configured, it removes any inherited `MYSQL_PWD` and
-sets the resolved password only in the child `mysqldump` environment. The
-parent and unrelated processes do not inherit it.
+sets the resolved password only in the child `mysqldump` environment. AWS
+access/secret/session credentials, profiles, and credential/config file
+pointers are removed from that child environment; ordinary process variables
+and the job's `MYSQL_PWD` remain available. The parent and unrelated processes
+do not inherit the MySQL password.
 
 This avoids exposing a password in command-line listings and avoids managing a
 temporary option file, but environment inspection may still be possible to a

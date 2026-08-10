@@ -145,3 +145,57 @@ func TestDatabaseSelectionRejectsInvalidValues(t *testing.T) {
 		})
 	}
 }
+
+// This fails if YAML nulls, scalar coercions, aliases/merges, or wrong
+// collection kinds silently become Go zero values before validation.
+func TestDecodeRejectsNonCanonicalYAMLTypesAndIndirection(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "numeric string version", input: "version: '1'\n"},
+		{name: "numeric string port", input: "version: 1\njobs:\n  production:\n    mysql:\n      port: '3307'\n"},
+		{name: "numeric string rotation", input: "version: 1\nlogging:\n  rotation:\n    max_size_mb: '10'\n"},
+		{name: "numeric host coerced to string", input: "version: 1\njobs:\n  production:\n    mysql:\n      host: 127\n"},
+		{name: "boolean bucket coerced to string", input: "version: 1\njobs:\n  production:\n    s3:\n      bucket: true\n"},
+		{name: "null debug boolean", input: "version: 1\nlogging:\n  debug: null\n"},
+		{name: "null rotation boolean", input: "version: 1\nlogging:\n  rotation:\n    compress: null\n"},
+		{name: "null enabled boolean", input: "version: 1\njobs:\n  production:\n    enabled: null\n"},
+		{name: "null path style boolean", input: "version: 1\njobs:\n  production:\n    s3:\n      force_path_style: null\n"},
+		{name: "null string", input: "version: 1\njobs:\n  production:\n    mysql:\n      host: null\n"},
+		{name: "null integer", input: "version: 1\njobs:\n  production:\n    mysql:\n      port: null\n"},
+		{name: "null string sequence", input: "version: 1\njobs:\n  production:\n    mysql:\n      extra_args: null\n"},
+		{name: "jobs sequence", input: "version: 1\njobs: []\n"},
+		{name: "extra args mapping", input: "version: 1\njobs:\n  production:\n    mysql:\n      extra_args: {}\n"},
+		{name: "extra args numeric item", input: "version: 1\njobs:\n  production:\n    mysql:\n      extra_args: [1]\n"},
+		{name: "databases mapping", input: "version: 1\njobs:\n  production:\n    mysql:\n      databases: {}\n"},
+		{name: "custom tagged root mapping", input: "!unsafe {version: 1}\n"},
+		{name: "custom tagged jobs mapping", input: "version: 1\njobs: !unsafe {}\n"},
+		{name: "custom tagged extra args sequence", input: "version: 1\njobs:\n  production:\n    mysql:\n      extra_args: !unsafe [--quick]\n"},
+		{name: "custom tagged database sequence", input: "version: 1\njobs:\n  production:\n    mysql:\n      databases: !unsafe [application]\n"},
+		{
+			name: "aliased port",
+			input: "version: &port 1\n" +
+				"jobs:\n  production:\n    mysql:\n      port: *port\n",
+		},
+		{
+			name: "merged port",
+			input: "version: 1\n" +
+				"jobs:\n  production:\n    mysql:\n      <<: {port: 3307}\n",
+		},
+		{
+			name: "merged rotation",
+			input: "version: 1\n" +
+				"logging:\n  rotation:\n    <<: {max_size_mb: 1, max_files: 2, max_age_days: 3, compress: false}\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, findings := Decode(strings.NewReader(tt.input))
+			if !findings.HasErrors() {
+				t.Fatalf("Decode() findings = %v, want strict YAML type error", findings)
+			}
+		})
+	}
+}
