@@ -75,6 +75,9 @@ func TestResolverRejectsUnsafeOrOversizedFileSecretAtPointOfUse(t *testing.T) {
 			if err := os.WriteFile(path, []byte(tt.contents), tt.mode); err != nil {
 				t.Fatal(err)
 			}
+			if err := os.Chmod(path, tt.mode); err != nil {
+				t.Fatal(err)
+			}
 			_, err := (Resolver{}).Dump(config.JobConfig{
 				RunAs: currentResolverUsername(t),
 				MySQL: config.MySQLConfig{PasswordFile: path},

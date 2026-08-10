@@ -664,6 +664,9 @@ func TestValidatedSecretSymlinkSubstitutionIsRejectedAtResolution(t *testing.T) 
 	if err := os.WriteFile(attacker, []byte("attacker\n"), 0o660); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(attacker, 0o660); err != nil {
+		t.Fatal(err)
+	}
 	link := filepath.Join(shared, "mysql-secret")
 	if err := os.Symlink(trusted, link); err != nil {
 		t.Fatal(err)

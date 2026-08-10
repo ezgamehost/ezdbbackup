@@ -73,6 +73,9 @@ func TestLoadRejectsUnsafeSourceMetadataAndCanonicalAncestors(t *testing.T) {
 		if err := os.WriteFile(path, []byte("version: 1\n"), 0o660); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.Chmod(path, 0o660); err != nil {
+			t.Fatal(err)
+		}
 		if _, findings := Load(path); !findings.HasErrors() || !strings.Contains(findings.Error(), "writable") {
 			t.Fatalf("Load(group-writable) findings = %v, want rejection", findings)
 		}
