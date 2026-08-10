@@ -1,0 +1,9 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: ezdbbackup
+Source: https://github.com/ezgamehost/ezdbbackup
+
+Files: *
+Copyright: 2026 EZ Game Host
+License: All-rights-reserved
+ No license grant is made by this package metadata. Contact
+ support@ezgamehost.com for licensing information.

@@ -10,6 +10,17 @@ if [[ ! "${version}" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
   echo "unsupported release tag for artifact names: ${version}" >&2
   exit 1
 fi
+package_version="${version#v}"
+if ! dpkg --validate-version "${package_version}" >/dev/null 2>&1; then
+  echo "release tag does not contain a valid Debian version: ${version}" >&2
+  exit 1
+fi
+release_epoch="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
+if [[ ! "${release_epoch}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "release timestamp must be a positive integer: ${release_epoch}" >&2
+  exit 1
+fi
+release_date="$(LC_ALL=C date -u -d "@${release_epoch}" '+%a, %d %b %Y %H:%M:%S +0000')"
 
 release_dist="${EZDBBACKUP_RELEASE_DIST_DIR:-dist}"
 mkdir -p "${release_dist}"
@@ -72,10 +83,46 @@ for arch in amd64 arm64; do
   archive="${release_dist}/ezdbbackup_${version}_linux_${arch}.tar.gz"
   tar -C "${package_dir}" -czf "${archive}" \
     ezdbbackup README.md config.example.yml
+
+  deb_root="${package_root}/deb_${arch}"
+  install -d -m 0755 \
+    "${deb_root}/DEBIAN" \
+    "${deb_root}/usr/bin" \
+    "${deb_root}/usr/share/doc/ezdbbackup/examples"
+  install -m 0755 "${binary}" "${deb_root}/usr/bin/ezdbbackup"
+  install -m 0644 README.md "${deb_root}/usr/share/doc/ezdbbackup/README.md"
+  install -m 0644 config.example.yml "${deb_root}/usr/share/doc/ezdbbackup/examples/config.yml"
+  install -m 0644 packaging/debian/copyright "${deb_root}/usr/share/doc/ezdbbackup/copyright"
+  sed \
+    -e "s/@VERSION@/${package_version}/g" \
+    -e "s/@DATE@/${release_date}/g" \
+    packaging/debian/changelog.template >"${deb_root}/usr/share/doc/ezdbbackup/changelog"
+  chmod 0644 "${deb_root}/usr/share/doc/ezdbbackup/changelog"
+  gzip -n -9 "${deb_root}/usr/share/doc/ezdbbackup/changelog"
+  cat >"${deb_root}/DEBIAN/control" <<EOF
+Package: ezdbbackup
+Version: ${package_version}
+Architecture: ${arch}
+Maintainer: EZ Game Host Support <support@ezgamehost.com>
+Section: admin
+Priority: optional
+Depends: ca-certificates
+Recommends: default-mysql-client, cron
+Homepage: https://github.com/ezgamehost/ezdbbackup
+Description: Static MySQL backup and S3 upload tool
+ ezdbbackup runs named MySQL dump jobs, stores structured local logs, and
+ uploads backup objects to Amazon S3 or compatible endpoints.
+EOF
+  chmod 0644 "${deb_root}/DEBIAN/control"
+
+  deb="${release_dist}/ezdbbackup_${package_version}_${arch}.deb"
+  dpkg-deb --root-owner-group --build "${deb_root}" "${deb}"
+  dpkg-deb --info "${deb}" >/dev/null
+  dpkg-deb --contents "${deb}" >/dev/null
 done
 
 (
   cd "${release_dist}"
-  sha256sum ezdbbackup_*.tar.gz > SHA256SUMS
+  sha256sum ezdbbackup_*.deb ezdbbackup_*.tar.gz > SHA256SUMS
   sha256sum -c SHA256SUMS
 )
