@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Unit tests
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Race tests
+        run: go test -race ./...
+      - name: Static build
+        run: CGO_ENABLED=0 go build -trimpath ./cmd/ezdbbackup
+
+  integration:
+    runs-on: ubuntu-latest
+    env:
+      COMPOSE_PROJECT_NAME: ezdbbackup-ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Docker versions
+        run: |
+          docker version
+          docker compose version
+      - name: Start LocalStack
+        run: docker compose -f test/compose.yml up -d --wait
+      - name: S3 integration test
+        run: AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 EZDBBACKUP_TEST_S3_ENDPOINT=http://127.0.0.1:4566 go test -tags=integration ./test/e2e -v
+      - name: Stop LocalStack
+        if: always()
+        run: docker compose -f test/compose.yml down -v
