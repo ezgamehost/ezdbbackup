@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/processcreds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
 )
@@ -319,6 +322,57 @@ func TestAWSFactorySanitizesConfigurationLoadFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "load configuration") || !strings.Contains(err.Error(), "status=418") {
 		t.Fatalf("AWSFactory.New() exposed configuration error: %q", err)
+	}
+}
+
+// This exercises the real default credential chain rather than the injected
+// configuration-loader boundary. It fails if raw credential_process output is
+// formatted for a human or if the SDK cause is discarded entirely.
+func TestS3ErrorBoundarySanitizesRealDefaultChainProviderFailure(t *testing.T) {
+	const marker = "DEFAULT_CHAIN_PROVIDER_SECRET"
+	directory := t.TempDir()
+	helper := filepath.Join(directory, "credential-helper")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '%s\\n' '"+marker+"'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sharedConfig := filepath.Join(directory, "config")
+	if err := os.WriteFile(sharedConfig, []byte("[profile leaky]\ncredential_process = "+helper+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{
+		"AWS_ACCESS_KEY_ID",
+		"AWS_SECRET_ACCESS_KEY",
+		"AWS_SESSION_TOKEN",
+		"AWS_WEB_IDENTITY_TOKEN_FILE",
+		"AWS_ROLE_ARN",
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+	} {
+		t.Setenv(name, "")
+	}
+	t.Setenv("AWS_PROFILE", "leaky")
+	t.Setenv("AWS_CONFIG_FILE", sharedConfig)
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(directory, "missing-credentials"))
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	store, err := (AWSFactory{}).New(context.Background(), Options{Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("AWSFactory.New() error = %v", err)
+	}
+	err = store.Probe(context.Background(), "example-backups")
+	if err == nil {
+		t.Fatal("Probe() error = nil")
+	}
+	if strings.Contains(err.Error(), marker) || strings.Contains(err.Error(), "credential_process") {
+		t.Fatalf("Probe() exposed default-chain provider output: %q", err)
+	}
+	if got := err.Error(); got != "S3 head bucket failed" {
+		t.Fatalf("Probe() error = %q, want fixed human-safe boundary", got)
+	}
+	var providerError *processcreds.ProviderError
+	if !errors.As(err, &providerError) || !strings.Contains(providerError.Error(), marker) {
+		t.Fatalf("errors.As(ProviderError) = %v, want preserved SDK provider cause", providerError)
 	}
 }
 

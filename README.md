@@ -456,15 +456,25 @@ go test ./...
 go test -race ./...
 go vet ./...
 
-# Tagged integration test against LocalStack.
-docker compose -f test/compose.yml up -d --wait
+# Tagged integration test against the pinned LocalStack image. Use a unique
+# Compose project and always remove containers, networks, volumes, and orphans.
+export COMPOSE_PROJECT_NAME="ezdbbackup-local-$$"
+trap 'docker compose -f test/compose.yml down -v --remove-orphans' EXIT
+docker compose -f test/compose.yml up -d --wait --wait-timeout 120
 AWS_ACCESS_KEY_ID=test \
 AWS_SECRET_ACCESS_KEY=test \
 AWS_REGION=us-east-1 \
 EZDBBACKUP_TEST_S3_ENDPOINT=http://127.0.0.1:4566 \
-  go test -tags=integration ./test/e2e -v
-docker compose -f test/compose.yml down -v
+  go test -count=1 -tags=integration ./test/e2e -v
+docker compose -f test/compose.yml down -v --remove-orphans
+trap - EXIT
 ```
+
+For a `v*` tag, the release workflow runs uncached unit tests, vet, race tests,
+the complete tagged LocalStack suite, and the static `linux/amd64` and
+`linux/arm64` build/package checks as separate gates. The publish job depends
+on every gate, rechecks `SHA256SUMS`, and is the only job granted
+`contents: write`; verification jobs cannot publish a release.
 
 To reproduce a release-style version locally:
 
