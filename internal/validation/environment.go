@@ -158,8 +158,8 @@ func (OSEnvironment) CheckCronPath(path string) error {
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("cron path %q must be absolute", path)
 	}
-	if strings.ContainsAny(path, "\n\x00") {
-		return fmt.Errorf("cron path %q must not contain a newline or NUL", path)
+	if strings.ContainsAny(path, "\r\n\x00%") {
+		return fmt.Errorf("cron path %q must not contain a newline, NUL, or cron-special %%", path)
 	}
 	return nil
 }

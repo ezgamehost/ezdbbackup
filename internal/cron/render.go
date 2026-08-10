@@ -76,6 +76,9 @@ func validateRenderedPath(name, value string) error {
 	if err := rejectLineBreakOrNUL(name+" path", value); err != nil {
 		return err
 	}
+	if strings.ContainsRune(value, '%') {
+		return fmt.Errorf("render cron: %s path contains cron-special %%", name)
+	}
 	if !filepath.IsAbs(value) {
 		return fmt.Errorf("render cron: %s path must be absolute", name)
 	}

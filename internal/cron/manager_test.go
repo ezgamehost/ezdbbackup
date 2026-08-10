@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestManagerInstallWritesExactContentAndMode(t *testing.T) {
@@ -49,7 +51,7 @@ func TestManagerInstallAtomicallyReplacesMarkedFile(t *testing.T) {
 		t.Fatalf("Install() error = %v", err)
 	}
 	assertFileContent(t, path, newContent)
-	assertDirectoryEntries(t, dir, "ezdbbackup")
+	assertDirectoryEntries(t, dir, ".ezdbbackup.lock", "ezdbbackup")
 }
 
 func TestManagerInstallRefusesUnmarkedExistingFile(t *testing.T) {
@@ -67,7 +69,7 @@ func TestManagerInstallRefusesUnmarkedExistingFile(t *testing.T) {
 		t.Fatal("Install() error = nil, want non-nil")
 	}
 	assertFileContent(t, path, unmanaged)
-	assertDirectoryEntries(t, dir, "ezdbbackup")
+	assertDirectoryEntries(t, dir, ".ezdbbackup.lock", "ezdbbackup")
 }
 
 func TestManagerInstallRejectsUnmarkedNewContent(t *testing.T) {
@@ -108,7 +110,7 @@ func TestManagerInstallRenameFailurePreservesPriorManagedFile(t *testing.T) {
 	}
 	assertFileContent(t, path, oldContent)
 	assertFileContent(t, otherTemp, []byte("leave me"))
-	assertDirectoryEntries(t, dir, ".ezdbbackup.tmp-someone-else", "ezdbbackup")
+	assertDirectoryEntries(t, dir, ".ezdbbackup.lock", ".ezdbbackup.tmp-someone-else", "ezdbbackup")
 }
 
 func TestManagerShowReturnsExactManagedContent(t *testing.T) {
@@ -190,6 +192,279 @@ func TestManagerRemoveSucceedsWhenFileIsAbsent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ezdbbackup")
 	if err := (Manager{Path: path}).Remove(); err != nil {
 		t.Fatalf("Remove() error = %v", err)
+	}
+}
+
+func TestManagerOperationsRejectSymlinkAndHardlinkDestinations(t *testing.T) {
+	t.Parallel()
+
+	operations := []struct {
+		name string
+		run  func(Manager) error
+	}{
+		{name: "install", run: func(manager Manager) error { return manager.Install(testManagedCron("replacement")) }},
+		{name: "show", run: func(manager Manager) error { _, err := manager.Show(); return err }},
+		{name: "remove", run: func(manager Manager) error { return manager.Remove() }},
+	}
+	entryKinds := []struct {
+		name string
+		make func(t *testing.T, target, path string)
+	}{
+		{name: "symlink", make: func(t *testing.T, target, path string) {
+			t.Helper()
+			if err := os.Symlink(target, path); err != nil {
+				t.Fatalf("Symlink() error = %v", err)
+			}
+		}},
+		{name: "hardlink", make: func(t *testing.T, target, path string) {
+			t.Helper()
+			if err := os.Link(target, path); err != nil {
+				t.Fatalf("Link() error = %v", err)
+			}
+		}},
+	}
+
+	for _, entryKind := range entryKinds {
+		for _, operation := range operations {
+			t.Run(entryKind.name+"/"+operation.name, func(t *testing.T) {
+				t.Parallel()
+				dir := t.TempDir()
+				target := filepath.Join(dir, "target")
+				path := filepath.Join(dir, "ezdbbackup")
+				content := testManagedCron("original")
+				if err := os.WriteFile(target, content, 0o644); err != nil {
+					t.Fatalf("WriteFile() error = %v", err)
+				}
+				entryKind.make(t, target, path)
+
+				if err := operation.run(Manager{Path: path}); err == nil {
+					t.Fatalf("%s() error = nil, want unsafe-entry error", operation.name)
+				}
+				assertFileContent(t, target, content)
+				if _, err := os.Lstat(path); err != nil {
+					t.Fatalf("Lstat(destination) error = %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestManagerInstallRefusesDestinationChangedAfterInspection(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ezdbbackup")
+	oldPath := filepath.Join(dir, "old-ezdbbackup")
+	unmanaged := []byte("# replacement owned by someone else\n")
+	if err := os.WriteFile(path, testManagedCron("original"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	manager := Manager{
+		Path: path,
+		beforeMutation: func() {
+			if err := os.Rename(path, oldPath); err != nil {
+				t.Errorf("Rename() error = %v", err)
+				return
+			}
+			if err := os.WriteFile(path, unmanaged, 0o644); err != nil {
+				t.Errorf("WriteFile(replacement) error = %v", err)
+			}
+		},
+	}
+
+	if err := manager.Install(testManagedCron("new")); err == nil {
+		t.Fatal("Install() error = nil, want changed-destination error")
+	}
+	assertFileContent(t, path, unmanaged)
+}
+
+func TestManagerRemoveRefusesDestinationChangedAfterInspection(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ezdbbackup")
+	oldPath := filepath.Join(dir, "old-ezdbbackup")
+	unmanaged := []byte("# replacement owned by someone else\n")
+	if err := os.WriteFile(path, testManagedCron("original"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	manager := Manager{
+		Path: path,
+		beforeMutation: func() {
+			if err := os.Rename(path, oldPath); err != nil {
+				t.Errorf("Rename() error = %v", err)
+				return
+			}
+			if err := os.WriteFile(path, unmanaged, 0o644); err != nil {
+				t.Errorf("WriteFile(replacement) error = %v", err)
+			}
+		},
+	}
+
+	if err := manager.Remove(); err == nil {
+		t.Fatal("Remove() error = nil, want changed-destination error")
+	}
+	assertFileContent(t, path, unmanaged)
+}
+
+func TestManagerMutationsRefuseOwnershipChangedInPlaceAfterInspection(t *testing.T) {
+	t.Parallel()
+
+	operations := []struct {
+		name string
+		run  func(Manager) error
+	}{
+		{name: "install", run: func(manager Manager) error { return manager.Install(testManagedCron("new")) }},
+		{name: "remove", run: func(manager Manager) error { return manager.Remove() }},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "ezdbbackup")
+			unmanaged := []byte("# ownership marker removed in place\n")
+			if err := os.WriteFile(path, testManagedCron("original"), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			manager := Manager{
+				Path: path,
+				beforeMutation: func() {
+					if err := os.WriteFile(path, unmanaged, 0o644); err != nil {
+						t.Errorf("WriteFile(replacement) error = %v", err)
+					}
+				},
+			}
+
+			if err := operation.run(manager); err == nil {
+				t.Fatalf("%s() error = nil, want changed-ownership error", operation.name)
+			}
+			assertFileContent(t, path, unmanaged)
+		})
+	}
+}
+
+func TestManagerRemoveTreatsFinalNotExistAsSuccess(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "ezdbbackup")
+	if err := os.WriteFile(path, testManagedCron("entry"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	manager := Manager{
+		Path: path,
+		remove: func(removePath string) error {
+			if err := os.Remove(removePath); err != nil {
+				return err
+			}
+			return &os.PathError{Op: "remove", Path: removePath, Err: os.ErrNotExist}
+		},
+	}
+
+	if err := manager.Remove(); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Lstat() error = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestManagerConcurrentInstallThenRemoveIsSerialized(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ezdbbackup")
+	if err := os.WriteFile(path, testManagedCron("original"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	renameEntered := make(chan struct{})
+	releaseRename := make(chan struct{})
+	install := Manager{
+		Path: path,
+		rename: func(oldPath, newPath string) error {
+			close(renameEntered)
+			<-releaseRename
+			return os.Rename(oldPath, newPath)
+		},
+	}
+	installDone := make(chan error, 1)
+	go func() { installDone <- install.Install(testManagedCron("installed")) }()
+	<-renameEntered
+
+	removeBlocked := make(chan struct{})
+	remove := Manager{Path: path, flock: expectContendedFlock(removeBlocked)}
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- remove.Remove() }()
+	assertOperationContendsOnLock(t, removeBlocked, removeDone)
+
+	close(releaseRename)
+	if err := <-installDone; err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if err := <-removeDone; err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Lstat() error = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestManagerConcurrentRemoveThenInstallIsSerialized(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ezdbbackup")
+	if err := os.WriteFile(path, testManagedCron("original"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	removeEntered := make(chan struct{})
+	releaseRemove := make(chan struct{})
+	remove := Manager{
+		Path: path,
+		remove: func(removePath string) error {
+			close(removeEntered)
+			<-releaseRemove
+			return os.Remove(removePath)
+		},
+	}
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- remove.Remove() }()
+	<-removeEntered
+
+	installBlocked := make(chan struct{})
+	install := Manager{Path: path, flock: expectContendedFlock(installBlocked)}
+	installDone := make(chan error, 1)
+	go func() { installDone <- install.Install(testManagedCron("installed")) }()
+	assertOperationContendsOnLock(t, installBlocked, installDone)
+
+	close(releaseRemove)
+	if err := <-removeDone; err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if err := <-installDone; err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	assertFileContent(t, path, testManagedCron("installed"))
+}
+
+func expectContendedFlock(blocked chan<- struct{}) func(int, int) error {
+	return func(fd, how int) error {
+		err := unix.Flock(fd, how|unix.LOCK_NB)
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			close(blocked)
+			return unix.Flock(fd, how)
+		}
+		if err != nil {
+			return err
+		}
+		return errors.New("mutation lock was not held by the active operation")
+	}
+}
+
+func assertOperationContendsOnLock(t *testing.T, blocked <-chan struct{}, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("concurrent operation did not contend on the active mutation lock: %v", err)
+	case <-blocked:
 	}
 }
 

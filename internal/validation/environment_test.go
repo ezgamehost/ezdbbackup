@@ -291,7 +291,7 @@ func TestOSEnvironmentUserAndCronPathRules(t *testing.T) {
 			t.Fatalf("CheckCronPath(%q) error = %v", valid, err)
 		}
 	}
-	for _, invalid := range []string{"relative", "/tmp/bad\npath", "/tmp/bad\x00path"} {
+	for _, invalid := range []string{"relative", "/tmp/bad\npath", "/tmp/bad\rpath", "/tmp/bad\x00path", "/tmp/bad%path"} {
 		if err := env.CheckCronPath(invalid); err == nil {
 			t.Fatalf("CheckCronPath(%q) error = nil", invalid)
 		}
