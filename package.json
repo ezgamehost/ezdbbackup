@@ -1,0 +1,9 @@
+{
+  "name": "ezdbbackup-release-tooling",
+  "private": true,
+  "description": "Release automation tooling; the Go module is the actual project.",
+  "devDependencies": {
+    "conventional-changelog-conventionalcommits": "10.3.0",
+    "semantic-release": "25.0.9"
+  }
+}
