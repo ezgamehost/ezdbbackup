@@ -1,3 +1,4 @@
 .worktrees/
 /ezdbbackup
 /dist/
+/node_modules/

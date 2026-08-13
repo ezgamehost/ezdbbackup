@@ -1,0 +1,48 @@
+name: Semantic Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: semantic-release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Install release tooling
+        run: npm ci
+
+      - name: Determine next version and push tag
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git tag --list 'v*' | sort >"${RUNNER_TEMP}/tags-before"
+          npx semantic-release
+          git tag --list 'v*' | sort >"${RUNNER_TEMP}/tags-after"
+          new_tag="$(comm -13 "${RUNNER_TEMP}/tags-before" "${RUNNER_TEMP}/tags-after" | head -n 1)"
+          echo "new-tag=${new_tag}" >>"${GITHUB_OUTPUT}"
+
+      # Tags pushed with GITHUB_TOKEN do not trigger tag-push workflows, so
+      # dispatch the release pipeline explicitly for the new tag.
+      - name: Trigger release pipeline
+        if: steps.semantic.outputs.new-tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_TAG: ${{ steps.semantic.outputs.new-tag }}
+        run: gh workflow run release.yml --ref "${NEW_TAG}"
